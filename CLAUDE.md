@@ -28,7 +28,7 @@ Go 1.26 + Fiber v2 web server with graceful shutdown.
 - **`config/`** — Env-var-based configuration. All settings have defaults.
 - **`server/`** — Creates Fiber app, listens on port, handles graceful shutdown on SIGINT/SIGTERM.
 - **`handler/`** — Route registration. `handler.go` is the central registry (`Register` function); each feature file (e.g. `health.go`) defines its own routes and handlers. New feature handlers should follow this pattern: create a file, define a `registerXxx(app)` function, and call it from `Register`.
-- **`wal/`** — Write-Ahead Log for storage engine recovery. Binary-encoded entries with CRC32 checksums. Uses buffered writes with batch fsync (`WAL.Sync()` or a composed `Syncer` for background interval). Entry format: `TotalLen(4B) | CRC32(4B) | Op(1B) | Index(8B) | TimeStamp(8B) | DataLen(4B) | Data` (little-endian). Core API: `Open`, `Append`, `Sync`, `Close`, `NewReader`, `NewSyncer`.
+- **`wal/`** — Write-Ahead Log for storage engine recovery. Binary-encoded entries with CRC32 checksums. Uses buffered writes with batch fsync (`WAL.Sync()` or a composed `Syncer` for background interval). Entry format: `TotalLen(4B) | CRC32(4B) | Op(1B) | Index(8B) | TimeStamp(8B) | DataLen(4B) | Data` (little-endian). Core API: `Open`, `(*WAL).Append`, `(*WAL).Sync`, `(*WAL).Close`, `NewReader`, `(*Reader).ReadEntry`, `(*Reader).Close`, `NewSyncer`, `(*Syncer).Start`, `(*Syncer).Stop`.
 
 ## Rules
 

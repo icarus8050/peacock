@@ -31,10 +31,10 @@ var (
 )
 
 type Entry struct {
-	Index     int64
-	Data      []byte
 	Op        EntryType
+	Index     int64
 	CreatedAt TimeStamp
+	Data      []byte
 }
 
 // Encode serializes the entry into the on-disk binary format.
@@ -77,7 +77,15 @@ func DecodeEntry(data []byte) (Entry, error) {
 		return Entry{}, ErrIncompleteEntry
 	}
 
-	body := data[lenSize : lenSize+totalLen]
+	return decodeBody(data[lenSize : lenSize+totalLen])
+}
+
+// decodeBody decodes the entry body (CRC + payload), without the TotalLen prefix.
+func decodeBody(body []byte) (Entry, error) {
+	if len(body) < headerSize {
+		return Entry{}, ErrIncompleteEntry
+	}
+
 	storedCRC := binary.LittleEndian.Uint32(body[0:crcSize])
 	payload := body[crcSize:]
 
