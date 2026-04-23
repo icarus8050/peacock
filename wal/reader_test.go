@@ -8,6 +8,15 @@ import (
 	"testing"
 )
 
+func TestOpenReaderNotExist(t *testing.T) {
+	dir := t.TempDir()
+
+	_, err := OpenReader(DefaultOptions(dir))
+	if !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("expected wrapped os.ErrNotExist, got %v", err)
+	}
+}
+
 func TestReadEmptyFile(t *testing.T) {
 	dir := t.TempDir()
 	w, err := Open(DefaultOptions(dir))
@@ -19,9 +28,9 @@ func TestReadEmptyFile(t *testing.T) {
 		t.Fatalf("Close: %v", err)
 	}
 
-	r, err := NewReader(path)
+	r, err := newReader(path)
 	if err != nil {
-		t.Fatalf("NewReader: %v", err)
+		t.Fatalf("newReader: %v", err)
 	}
 	defer r.Close()
 
@@ -64,9 +73,9 @@ func TestReadCorruptEntry(t *testing.T) {
 		t.Fatalf("WriteFile: %v", err)
 	}
 
-	r, err := NewReader(path)
+	r, err := newReader(path)
 	if err != nil {
-		t.Fatalf("NewReader: %v", err)
+		t.Fatalf("newReader: %v", err)
 	}
 	defer r.Close()
 
@@ -114,9 +123,9 @@ func TestReadPartialWrite(t *testing.T) {
 		t.Fatalf("Close partial: %v", err)
 	}
 
-	r, err := NewReader(path)
+	r, err := newReader(path)
 	if err != nil {
-		t.Fatalf("NewReader: %v", err)
+		t.Fatalf("newReader: %v", err)
 	}
 	defer r.Close()
 
@@ -169,9 +178,9 @@ func TestRecoveryTruncation(t *testing.T) {
 		t.Fatalf("WriteFile: %v", err)
 	}
 
-	r, err := NewReader(path)
+	r, err := newReader(path)
 	if err != nil {
-		t.Fatalf("NewReader: %v", err)
+		t.Fatalf("newReader: %v", err)
 	}
 	var validCount int
 	for {
@@ -206,9 +215,9 @@ func TestRecoveryTruncation(t *testing.T) {
 		t.Fatalf("Close new: %v", err)
 	}
 
-	r, err = NewReader(path)
+	r, err = newReader(path)
 	if err != nil {
-		t.Fatalf("NewReader after replay: %v", err)
+		t.Fatalf("newReader after replay: %v", err)
 	}
 	defer r.Close()
 

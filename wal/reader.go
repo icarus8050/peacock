@@ -12,8 +12,13 @@ type Reader struct {
 	file *os.File
 }
 
-// NewReader opens the WAL file at path for sequential reading.
-func NewReader(path string) (*Reader, error) {
+// OpenReader opens the WAL file described by opts for sequential reading.
+// Returns a wrapped os.ErrNotExist when the file does not yet exist.
+func OpenReader(opts Options) (*Reader, error) {
+	return newReader(opts.withDefaults().path())
+}
+
+func newReader(path string) (*Reader, error) {
 	file, err := os.Open(path)
 	if err != nil {
 		return nil, fmt.Errorf("wal: open: %w", err)

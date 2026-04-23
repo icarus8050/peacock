@@ -9,20 +9,19 @@ import (
 	"peacock/wal"
 )
 
-// replay rebuilds the in-memory map by scanning the WAL at path. Tail
-// corruption (torn write or CRC mismatch on the last entries) is treated
-// as the end of the log — earlier entries are still applied.
+// replay rebuilds the in-memory map by scanning the WAL described by opts.
+// Tail corruption (torn write or CRC mismatch on the last entries) is
+// treated as the end of the log — earlier entries are still applied.
 //
 // Returns the reconstructed map and the next index to assign.
-func replay(path string) (map[string][]byte, int64, error) {
+func replay(opts wal.Options) (map[string][]byte, int64, error) {
 	data := make(map[string][]byte)
 	var lastIndex int64 = -1
 
-	if _, err := os.Stat(path); errors.Is(err, os.ErrNotExist) {
+	r, err := wal.OpenReader(opts)
+	if errors.Is(err, os.ErrNotExist) {
 		return data, 0, nil
 	}
-
-	r, err := wal.NewReader(path)
 	if err != nil {
 		return nil, 0, fmt.Errorf("kv: open reader: %w", err)
 	}

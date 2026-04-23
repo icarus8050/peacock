@@ -65,9 +65,7 @@ func (e *Entry) Encode() []byte {
 	return buf
 }
 
-// DecodeEntry deserializes an entry from the full encoded bytes
-// (including TotalLen prefix). Returns ErrChecksumMismatch on CRC failure.
-func DecodeEntry(data []byte) (Entry, error) {
+func decodeEntry(data []byte) (Entry, error) {
 	if len(data) < lenSize+headerSize {
 		return Entry{}, ErrIncompleteEntry
 	}

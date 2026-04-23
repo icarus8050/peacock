@@ -3,7 +3,6 @@ package kv
 import (
 	"errors"
 	"fmt"
-	"path/filepath"
 	"sync"
 	"time"
 
@@ -26,9 +25,8 @@ func Open(opts Options) (*Store, error) {
 	opts = opts.withDefaults()
 
 	walOpts := wal.DefaultOptions(opts.DirPath)
-	path := filepath.Join(walOpts.DirPath, walOpts.FileName)
 
-	data, nextIndex, err := replay(path)
+	data, nextIndex, err := replay(walOpts)
 	if err != nil {
 		return nil, err
 	}

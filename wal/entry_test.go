@@ -6,18 +6,18 @@ import (
 
 func TestEncodeDecodePut(t *testing.T) {
 	e := Entry{Op: OpPut, Index: 1, CreatedAt: 1000, Data: []byte("hello:world")}
-	got, err := DecodeEntry(e.Encode())
+	got, err := decodeEntry(e.Encode())
 	if err != nil {
-		t.Fatalf("DecodeEntry: %v", err)
+		t.Fatalf("decodeEntry: %v", err)
 	}
 	assertEntry(t, e, got)
 }
 
 func TestEncodeDecodeDelete(t *testing.T) {
 	e := Entry{Op: OpDelete, Index: 2, CreatedAt: 2000, Data: nil}
-	got, err := DecodeEntry(e.Encode())
+	got, err := decodeEntry(e.Encode())
 	if err != nil {
-		t.Fatalf("DecodeEntry: %v", err)
+		t.Fatalf("decodeEntry: %v", err)
 	}
 	assertEntry(t, e, got)
 }
@@ -28,18 +28,18 @@ func TestEncodeDecodeLargeData(t *testing.T) {
 		d[i] = byte(i % 251)
 	}
 	e := Entry{Op: OpPut, Index: 3, CreatedAt: 3000, Data: d}
-	got, err := DecodeEntry(e.Encode())
+	got, err := decodeEntry(e.Encode())
 	if err != nil {
-		t.Fatalf("DecodeEntry: %v", err)
+		t.Fatalf("decodeEntry: %v", err)
 	}
 	assertEntry(t, e, got)
 }
 
 func TestEncodeDecodeEmptyData(t *testing.T) {
 	e := Entry{Op: OpPut, Index: 4, CreatedAt: 4000, Data: nil}
-	got, err := DecodeEntry(e.Encode())
+	got, err := decodeEntry(e.Encode())
 	if err != nil {
-		t.Fatalf("DecodeEntry: %v", err)
+		t.Fatalf("decodeEntry: %v", err)
 	}
 	if got.Op != e.Op {
 		t.Fatalf("op mismatch: got %v, want %v", got.Op, e.Op)
@@ -56,7 +56,7 @@ func TestDecodeChecksumMismatch(t *testing.T) {
 	// Flip a byte in the payload (after TotalLen + CRC).
 	data[10] ^= 0xFF
 
-	_, err := DecodeEntry(data)
+	_, err := decodeEntry(data)
 	if err != ErrChecksumMismatch {
 		t.Fatalf("expected ErrChecksumMismatch, got %v", err)
 	}
@@ -66,7 +66,7 @@ func TestDecodeIncompleteEntry(t *testing.T) {
 	e := Entry{Op: OpPut, Index: 6, CreatedAt: 6000, Data: []byte("value")}
 	data := e.Encode()
 
-	_, err := DecodeEntry(data[:8])
+	_, err := decodeEntry(data[:8])
 	if err != ErrIncompleteEntry {
 		t.Fatalf("expected ErrIncompleteEntry, got %v", err)
 	}

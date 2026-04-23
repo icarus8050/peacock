@@ -48,7 +48,7 @@ func TestAppendAndReplay(t *testing.T) {
 	w.Close()
 
 	// Replay.
-	r, err := NewReader(path)
+	r, err := newReader(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -83,7 +83,7 @@ func TestAppendWithoutExplicitSync(t *testing.T) {
 	// Close should flush+sync.
 	w.Close()
 
-	r, err := NewReader(path)
+	r, err := newReader(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -116,7 +116,7 @@ func TestMultipleAppendSyncCycles(t *testing.T) {
 	path := w.Path()
 	w.Close()
 
-	r, err := NewReader(path)
+	r, err := newReader(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -153,7 +153,7 @@ func TestConcurrentAppend(t *testing.T) {
 	w.Close()
 
 	// Verify all entries can be read.
-	r, err := NewReader(path)
+	r, err := newReader(path)
 	if err != nil {
 		t.Fatal(err)
 	}

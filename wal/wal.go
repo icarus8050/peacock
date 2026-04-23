@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"path/filepath"
 	"sync"
 )
 
@@ -19,29 +18,20 @@ type WAL struct {
 }
 
 func Open(opts Options) (*WAL, error) {
+	opts = opts.withDefaults()
+
 	if err := os.MkdirAll(opts.DirPath, 0755); err != nil {
 		return nil, fmt.Errorf("wal: mkdir: %w", err)
 	}
 
-	fileName := opts.FileName
-	if fileName == "" {
-		fileName = "wal.log"
-	}
-	path := filepath.Join(opts.DirPath, fileName)
-
-	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0644)
+	file, err := os.OpenFile(opts.path(), os.O_CREATE|os.O_RDWR|os.O_APPEND, 0644)
 	if err != nil {
 		return nil, fmt.Errorf("wal: open: %w", err)
 	}
 
-	bufSize := opts.BufferSize
-	if bufSize <= 0 {
-		bufSize = 32 * 1024
-	}
-
 	return &WAL{
 		file:   file,
-		writer: bufio.NewWriterSize(file, bufSize),
+		writer: bufio.NewWriterSize(file, opts.BufferSize),
 	}, nil
 }
 
