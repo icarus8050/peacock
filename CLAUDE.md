@@ -40,3 +40,14 @@ Go 1.26 + Fiber v2 web server with graceful shutdown.
 - @.claude/rules/commit.md — 커밋 메시지 규칙
 - @.claude/rules/go-style.md — Go 코드 스타일 규칙
 - @.claude/rules/testing.md — 테스트 작성 규칙
+
+## Workflow (피드백 루프)
+
+복잡한 변경은 아래 사이클로 수행한다. 사이클을 돌 때마다 스킬·규칙이 점진적으로 보강되도록 마지막 단계(회고)를 항상 고려한다.
+
+1. **계획 + 개발** — 주 에이전트. 아키텍처 판단이 비자명하면 `Plan` sub-agent 호출.
+2. **독립 리뷰** — 비-trivial 변경(새 패키지, 공개 API 변경, ~50라인 이상) 후 `code-reviewer` sub-agent를 `Agent` 툴로 호출한다 (`.claude/agents/code-reviewer.md`). fresh context에서 `refactor-scan`/`self-review` 체크리스트로 검토.
+3. **피드백 반영** — 주 에이전트가 리뷰 결과를 보고 수정. 사용자 확인 후 커밋.
+4. **회고 (학습)** — 세션 말미 또는 "놓쳤다가 잡힌 문제"가 있었을 때 `/retrospect` 실행. 기존 스킬·규칙 보강을 우선하고, 꼭 필요할 때만 신규 스킬을 만든다. 한 세션에 과도하게 부풀리지 않는다 (1~2개 이내).
+
+가벼운 단일 파일 변경은 (1)만으로 충분. (2)~(4)는 규모/복잡도에 맞춰 선택적으로 적용.
