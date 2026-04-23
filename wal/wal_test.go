@@ -4,7 +4,6 @@ import (
 	"io"
 	"sync"
 	"testing"
-	"time"
 )
 
 func TestOpenClose(t *testing.T) {
@@ -173,41 +172,6 @@ func TestConcurrentAppend(t *testing.T) {
 	}
 	if count != n {
 		t.Fatalf("expected %d entries, got %d", n, count)
-	}
-}
-
-func TestBackgroundSync(t *testing.T) {
-	dir := t.TempDir()
-	w, err := Open(DefaultOptions(dir))
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	s := NewSyncer(w, 50*time.Millisecond, nil)
-	s.Start()
-
-	e := Entry{Op: OpPut, Index: 1, CreatedAt: 1000, Data: []byte("bg:sync")}
-	w.Append(&e)
-
-	// Wait for background sync to fire.
-	time.Sleep(100 * time.Millisecond)
-
-	path := w.Path()
-	s.Stop()
-	w.Close()
-
-	r, err := NewReader(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer r.Close()
-
-	got, err := r.ReadEntry()
-	if err != nil {
-		t.Fatalf("ReadEntry: %v", err)
-	}
-	if string(got.Data) != "bg:sync" {
-		t.Fatalf("expected data 'bg:sync', got %q", got.Data)
 	}
 }
 

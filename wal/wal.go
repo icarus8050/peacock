@@ -76,7 +76,7 @@ func (w *WAL) Sync() error {
 }
 
 // Close flushes, syncs, and closes the underlying file. Callers that run
-// a background Syncer against this WAL must Stop() it before calling Close.
+// a background goroutine calling Sync must stop it before calling Close.
 func (w *WAL) Close() error {
 	w.mu.Lock()
 	defer w.mu.Unlock()

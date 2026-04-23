@@ -1,21 +1,21 @@
-package wal
+package kv
 
 import "time"
 
-type Syncable interface {
+type syncable interface {
 	Sync() error
 }
 
-type Syncer struct {
-	target   Syncable
+type syncer struct {
+	target   syncable
 	interval time.Duration
 	onError  func(error)
 	stopCh   chan struct{}
 	doneCh   chan struct{}
 }
 
-func NewSyncer(target Syncable, interval time.Duration, onError func(error)) *Syncer {
-	return &Syncer{
+func newSyncer(target syncable, interval time.Duration, onError func(error)) *syncer {
+	return &syncer{
 		target:   target,
 		interval: interval,
 		onError:  onError,
@@ -24,18 +24,16 @@ func NewSyncer(target Syncable, interval time.Duration, onError func(error)) *Sy
 	}
 }
 
-// Start launches the background sync goroutine.
-func (s *Syncer) Start() {
+func (s *syncer) start() {
 	go s.loop()
 }
 
-// Stop signals the background goroutine to stop and waits for it to finish.
-func (s *Syncer) Stop() {
+func (s *syncer) stop() {
 	close(s.stopCh)
 	<-s.doneCh
 }
 
-func (s *Syncer) loop() {
+func (s *syncer) loop() {
 	defer close(s.doneCh)
 	ticker := time.NewTicker(s.interval)
 	defer ticker.Stop()

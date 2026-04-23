@@ -16,7 +16,7 @@ type Store struct {
 	mu        sync.RWMutex
 	data      map[string][]byte
 	wal       *wal.WAL
-	syncer    *wal.Syncer
+	syncer    *syncer
 	nextIndex int64
 }
 
@@ -43,8 +43,8 @@ func Open(opts Options) (*Store, error) {
 		wal:       w,
 		nextIndex: nextIndex,
 	}
-	s.syncer = wal.NewSyncer(w, opts.SyncInterval, opts.OnSyncError)
-	s.syncer.Start()
+	s.syncer = newSyncer(w, opts.SyncInterval, opts.OnSyncError)
+	s.syncer.start()
 
 	return s, nil
 }
@@ -103,6 +103,6 @@ func (s *Store) Delete(key string) error {
 // Close stops the background syncer and closes the underlying WAL, which
 // flushes any buffered writes to disk.
 func (s *Store) Close() error {
-	s.syncer.Stop()
+	s.syncer.stop()
 	return s.wal.Close()
 }
