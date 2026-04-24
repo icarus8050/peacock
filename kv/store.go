@@ -23,8 +23,7 @@ type Store struct {
 // background syncer that fsyncs the WAL on opts.SyncInterval.
 func Open(opts Options) (*Store, error) {
 	opts = opts.withDefaults()
-
-	walOpts := wal.DefaultOptions(opts.DirPath)
+	walOpts := walOptionsFrom(opts)
 
 	data, nextIndex, err := replay(walOpts)
 	if err != nil {
@@ -103,4 +102,12 @@ func (s *Store) Delete(key string) error {
 func (s *Store) Close() error {
 	s.syncer.stop()
 	return s.wal.Close()
+}
+
+func walOptionsFrom(opts Options) wal.Options {
+	walOpts := wal.DefaultOptions(opts.DirPath)
+	if opts.MaxSegmentSize > 0 {
+		walOpts.MaxSegmentSize = opts.MaxSegmentSize
+	}
+	return walOpts
 }

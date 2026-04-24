@@ -9,27 +9,64 @@ import (
 )
 
 type Reader struct {
-	file *os.File
+	file  *os.File
+	paths []string
 }
 
-// OpenReader opens the WAL file described by opts for sequential reading.
-// Returns a wrapped os.ErrNotExist when the file does not yet exist.
 func OpenReader(opts Options) (*Reader, error) {
-	return newReader(opts.withDefaults().path())
-}
+	opts = opts.withDefaults()
 
-func newReader(path string) (*Reader, error) {
-	file, err := os.Open(path)
+	seqs, err := listSegments(opts.DirPath)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, fmt.Errorf("wal: open: %w", os.ErrNotExist)
+		}
+		return nil, fmt.Errorf("wal: list segments: %w", err)
+	}
+	if len(seqs) == 0 {
+		return nil, fmt.Errorf("wal: open: %w", os.ErrNotExist)
+	}
+
+	paths := make([]string, len(seqs))
+	for i, s := range seqs {
+		paths[i] = segmentPath(opts.DirPath, s)
+	}
+
+	file, err := os.Open(paths[0])
 	if err != nil {
 		return nil, fmt.Errorf("wal: open: %w", err)
 	}
-	return &Reader{file: file}, nil
+	return &Reader{file: file, paths: paths[1:]}, nil
 }
 
-// ReadEntry reads the next entry from the WAL. Returns io.EOF when there
-// are no more entries. Returns ErrIncompleteEntry or ErrChecksumMismatch
-// if the entry is corrupt or partially written.
 func (r *Reader) ReadEntry() (Entry, error) {
+	for {
+		entry, err := r.readCurrent()
+		if errors.Is(err, io.EOF) && len(r.paths) > 0 {
+			if err := r.advance(); err != nil {
+				return Entry{}, err
+			}
+			continue
+		}
+		return entry, err
+	}
+}
+
+func (r *Reader) advance() error {
+	if err := r.file.Close(); err != nil {
+		return fmt.Errorf("wal: close segment: %w", err)
+	}
+	next := r.paths[0]
+	r.paths = r.paths[1:]
+	file, err := os.Open(next)
+	if err != nil {
+		return fmt.Errorf("wal: open segment: %w", err)
+	}
+	r.file = file
+	return nil
+}
+
+func (r *Reader) readCurrent() (Entry, error) {
 	var lenBuf [lenSize]byte
 	_, err := io.ReadFull(r.file, lenBuf[:])
 	if errors.Is(err, io.ErrUnexpectedEOF) {

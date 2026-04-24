@@ -19,6 +19,7 @@ Server config is loaded from env vars in `config/config.go`:
 - `PORT` (default: `3000`), `READ_TIMEOUT` (default: `5s`), `WRITE_TIMEOUT` (default: `10s`), `SHUTDOWN_TIMEOUT` (default: `10s`)
 - `KV_DIR` (default: `data`) — KV store + WAL directory.
 - `KV_SYNC_INTERVAL_MS` (default: `100`) — background fsync interval in milliseconds.
+- `WAL_MAX_SEGMENT_SIZE_MB` (default: `64`) — WAL segment 파일이 이 크기를 넘기면 다음 세그먼트로 롤한다. `0`을 주면 kv/wal 기본값을 사용한다.
 - Timeout values are in seconds unless noted otherwise.
 
 ## Architecture
@@ -30,8 +31,8 @@ Go 1.26 + Fiber v2 web server with graceful shutdown.
 - **`config/`** — Env-var-based configuration. All settings have defaults.
 - **`server/`** — Creates Fiber app, listens on port, handles graceful shutdown on SIGINT/SIGTERM.
 - **`handler/`** — Route registration. `handler.go` is the central registry (`Register` function); each feature file (e.g. `health.go`, `kv.go`) defines its own routes and handlers. New feature handlers should follow this pattern: create a file, define a `registerXxx(app, deps...)` function, and call it from `Register`.
-- **`wal/`** — Write-Ahead Log for storage engine recovery. Binary-encoded entries with CRC32 checksums. Uses buffered writes with `WAL.Sync()` for explicit fsync; callers needing periodic sync run their own goroutine. Entry format: `TotalLen(4B) | CRC32(4B) | Op(1B) | Index(8B) | TimeStamp(8B) | DataLen(4B) | Data` (little-endian). Core API: `Open`, `(*WAL).Append`, `(*WAL).Sync`, `(*WAL).Close`, `OpenReader`, `(*Reader).ReadEntry`, `(*Reader).Close`.
-- **`kv/`** — In-memory key-value store backed by WAL. Writes append to WAL (buffered), an internal periodic syncer (`kv/syncer.go`) fsyncs on `KV_SYNC_INTERVAL_MS`. On `Open`, the WAL is replayed into the map; tail corruption (`ErrIncompleteEntry` / `ErrChecksumMismatch`) is treated as the end of the log. Entry.Data payload: `KeyLen(4B) | Key | Value` (Delete carries empty Value). The default `SyncInterval` (`100ms`) is owned by `kv` — `config` passes `0` to opt into it. Core API: `Open`, `Options`, `DefaultOptions`, `(*Store).Get`, `(*Store).Put`, `(*Store).Delete`, `(*Store).Close`. HTTP surface: `GET /kv/:key`, `PUT /kv/:key` (raw body = value), `DELETE /kv/:key`.
+- **`wal/`** — Write-Ahead Log for storage engine recovery. Binary-encoded entries with CRC32 checksums. Uses buffered writes with `WAL.Sync()` for explicit fsync; callers needing periodic sync run their own goroutine. Entry format: `TotalLen(4B) | CRC32(4B) | Op(1B) | Index(8B) | TimeStamp(8B) | DataLen(4B) | Data` (little-endian). 로그는 `wal-NNNNNNNNNN.log` 세그먼트 파일로 분할되며, `Append`가 `Options.MaxSegmentSize`를 넘기면 flush+fsync 후 다음 시퀀스로 롤한다. 엔트리는 세그먼트 경계를 가로지르지 않는다 — 한계보다 큰 엔트리는 빈 세그먼트를 단독 점유해 기록되고, 다음 Append부터 다시 롤이 적용된다. `OpenReader`는 모든 세그먼트를 순서대로 순회한다. 롤 경로(Flush+Sync+Close+Open) 중 close/open 실패는 WAL을 복구 불가 상태로 만들어 닫아버리며, 호출자는 재오픈해야 한다. Core API: `Open`, `(*WAL).Append`, `(*WAL).Sync`, `(*WAL).Close`, `OpenReader`, `(*Reader).ReadEntry`, `(*Reader).Close`.
+- **`kv/`** — In-memory key-value store backed by WAL. Writes append to WAL (buffered), an internal periodic syncer (`kv/syncer.go`) fsyncs on `KV_SYNC_INTERVAL_MS`. On `Open`, the WAL 세그먼트들이 순서대로 재생되어 맵을 복원한다; tail corruption (`ErrIncompleteEntry` / `ErrChecksumMismatch`) is treated as the end of the log. Entry.Data payload: `KeyLen(4B) | Key | Value` (Delete carries empty Value). The default `SyncInterval` (`100ms`) is owned by `kv` — `config` passes `0` to opt into it. `Options.MaxSegmentSize`에 값이 있으면 WAL 기본값(64MiB)을 덮어쓴다. Core API: `Open`, `Options`, `DefaultOptions`, `(*Store).Get`, `(*Store).Put`, `(*Store).Delete`, `(*Store).Close`. HTTP surface: `GET /kv/:key`, `PUT /kv/:key` (raw body = value), `DELETE /kv/:key`.
 
 ## Rules
 

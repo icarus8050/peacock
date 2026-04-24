@@ -13,8 +13,9 @@ func main() {
 	cfg := config.Load()
 
 	store, err := kv.Open(kv.Options{
-		DirPath:      cfg.KVDir,
-		SyncInterval: cfg.KVSyncInterval,
+		DirPath:        cfg.KVDir,
+		SyncInterval:   cfg.KVSyncInterval,
+		MaxSegmentSize: cfg.WALMaxSegmentSize,
 		OnSyncError: func(err error) {
 			log.Printf("kv: background sync: %v", err)
 		},

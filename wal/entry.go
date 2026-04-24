@@ -65,19 +65,6 @@ func (e *Entry) Encode() []byte {
 	return buf
 }
 
-func decodeEntry(data []byte) (Entry, error) {
-	if len(data) < lenSize+headerSize {
-		return Entry{}, ErrIncompleteEntry
-	}
-
-	totalLen := int(binary.LittleEndian.Uint32(data[0:lenSize]))
-	if len(data) < lenSize+totalLen {
-		return Entry{}, ErrIncompleteEntry
-	}
-
-	return decodeBody(data[lenSize : lenSize+totalLen])
-}
-
 // decodeBody decodes the entry body (CRC + payload), without the TotalLen prefix.
 func decodeBody(body []byte) (Entry, error) {
 	if len(body) < headerSize {

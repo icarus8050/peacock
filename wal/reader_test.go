@@ -4,7 +4,6 @@ import (
 	"errors"
 	"io"
 	"os"
-	"path/filepath"
 	"testing"
 )
 
@@ -23,7 +22,7 @@ func TestReadEmptyFile(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
-	path := w.Path()
+	path := w.path()
 	if err := w.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
@@ -57,7 +56,7 @@ func TestReadCorruptEntry(t *testing.T) {
 	if err := w.Sync(); err != nil {
 		t.Fatalf("Sync: %v", err)
 	}
-	path := w.Path()
+	path := w.path()
 	if err := w.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
@@ -106,7 +105,7 @@ func TestReadPartialWrite(t *testing.T) {
 	if err := w.Sync(); err != nil {
 		t.Fatalf("Sync: %v", err)
 	}
-	path := w.Path()
+	path := w.path()
 	if err := w.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
@@ -144,7 +143,7 @@ func TestReadPartialWrite(t *testing.T) {
 
 func TestRecoveryTruncation(t *testing.T) {
 	dir := t.TempDir()
-	path := filepath.Join(dir, "wal.log")
+	path := segmentPath(dir, 1)
 
 	w, err := Open(DefaultOptions(dir))
 	if err != nil {

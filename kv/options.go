@@ -5,9 +5,10 @@ import "time"
 const defaultSyncInterval = 100 * time.Millisecond
 
 type Options struct {
-	DirPath      string
-	SyncInterval time.Duration
-	OnSyncError  func(error)
+	DirPath        string
+	SyncInterval   time.Duration
+	MaxSegmentSize int64
+	OnSyncError    func(error)
 }
 
 func DefaultOptions(dir string) Options {

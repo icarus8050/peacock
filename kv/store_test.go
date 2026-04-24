@@ -146,6 +146,44 @@ func TestBackgroundSyncPersists(t *testing.T) {
 	}
 }
 
+func TestRecoveryAcrossRolledSegments(t *testing.T) {
+	dir := t.TempDir()
+	opts := DefaultOptions(dir)
+	opts.MaxSegmentSize = 80
+
+	s, err := Open(opts)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	const n = 20
+	for i := 0; i < n; i++ {
+		key := string(rune('a' + (i % 26)))
+		if err := s.Put(key+"-"+string(rune('0'+i%10)), []byte{byte(i)}); err != nil {
+			t.Fatalf("Put[%d]: %v", i, err)
+		}
+	}
+	if err := s.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	s2, err := Open(opts)
+	if err != nil {
+		t.Fatalf("Reopen: %v", err)
+	}
+	defer s2.Close()
+
+	for i := 0; i < n; i++ {
+		key := string(rune('a'+(i%26))) + "-" + string(rune('0'+i%10))
+		got, err := s2.Get(key)
+		if err != nil {
+			t.Fatalf("Get[%d] %s: %v", i, key, err)
+		}
+		if !bytes.Equal(got, []byte{byte(i)}) {
+			t.Fatalf("Get[%d] %s: got %v, want %v", i, key, got, []byte{byte(i)})
+		}
+	}
+}
+
 func TestEmptyValuePutVsDelete(t *testing.T) {
 	dir := t.TempDir()
 	s, err := Open(DefaultOptions(dir))
