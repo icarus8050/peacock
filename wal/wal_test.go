@@ -241,6 +241,173 @@ func TestOpenReaderIgnoresOrphanSegment(t *testing.T) {
 	}
 }
 
+func TestOpenFailsOnMissingSegment(t *testing.T) {
+	dir := t.TempDir()
+	w, err := Open(DefaultOptions(dir))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	if err := os.Remove(segmentPath(dir, 1)); err != nil {
+		t.Fatalf("remove segment: %v", err)
+	}
+
+	_, err = Open(DefaultOptions(dir))
+	if !errors.Is(err, ErrMissingSegment) {
+		t.Fatalf("expected ErrMissingSegment, got %v", err)
+	}
+}
+
+func TestOpenReaderFailsOnMissingSegment(t *testing.T) {
+	dir := t.TempDir()
+	w, err := Open(DefaultOptions(dir))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	e := Entry{Op: OpPut, Index: 1, CreatedAt: 1, Data: []byte("v")}
+	if err := w.Append(&e); err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	if err := os.Remove(segmentPath(dir, 1)); err != nil {
+		t.Fatalf("remove segment: %v", err)
+	}
+
+	_, err = OpenReader(DefaultOptions(dir))
+	if !errors.Is(err, ErrMissingSegment) {
+		t.Fatalf("expected ErrMissingSegment, got %v", err)
+	}
+}
+
+func TestOpenFailsOnCorruptManifest(t *testing.T) {
+	dir := t.TempDir()
+	w, err := Open(DefaultOptions(dir))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	// CRC 트레일러를 뒤집어 매니페스트 손상. fallback 없이 ErrManifestCorrupt가
+	// 호출자까지 그대로 노출되어야 한다.
+	path := filepath.Join(dir, manifestFileName)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	data[len(data)-1] ^= 0xFF
+	if err := os.WriteFile(path, data, 0644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	_, err = Open(DefaultOptions(dir))
+	if !errors.Is(err, ErrManifestCorrupt) {
+		t.Fatalf("expected ErrManifestCorrupt (no fallback), got %v", err)
+	}
+}
+
+func TestOpenReaderFailsOnCorruptManifest(t *testing.T) {
+	dir := t.TempDir()
+	w, err := Open(DefaultOptions(dir))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	e := Entry{Op: OpPut, Index: 1, CreatedAt: 1, Data: []byte("v")}
+	if err := w.Append(&e); err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	path := filepath.Join(dir, manifestFileName)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	data[len(data)-1] ^= 0xFF
+	if err := os.WriteFile(path, data, 0644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	_, err = OpenReader(DefaultOptions(dir))
+	if !errors.Is(err, ErrManifestCorrupt) {
+		t.Fatalf("expected ErrManifestCorrupt (no fallback), got %v", err)
+	}
+}
+
+func TestOpenRejectsEmptyManifest(t *testing.T) {
+	dir := t.TempDir()
+
+	// 정상 코드는 빈 segments 매니페스트를 만들지 않는다. 직접 만들어 invariant
+	// 위반이 corrupt로 거절되는지 확인한다.
+	if err := writeManifest(dir, &manifest{generation: 1}); err != nil {
+		t.Fatalf("writeManifest: %v", err)
+	}
+
+	_, err := Open(DefaultOptions(dir))
+	if !errors.Is(err, ErrManifestCorrupt) {
+		t.Fatalf("expected ErrManifestCorrupt, got %v", err)
+	}
+}
+
+func TestStaleTmpManifestIgnoredOnOpen(t *testing.T) {
+	dir := t.TempDir()
+	w, err := Open(DefaultOptions(dir))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	// 이전 크래시로 남았을 법한 garbage manifest.tmp. 정상 매니페스트는 건재.
+	tmpPath := filepath.Join(dir, manifestTmpFileName)
+	if err := os.WriteFile(tmpPath, []byte("garbage"), 0644); err != nil {
+		t.Fatalf("WriteFile tmp: %v", err)
+	}
+
+	w, err = Open(DefaultOptions(dir))
+	if err != nil {
+		t.Fatalf("Open with stale tmp: %v", err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+}
+
+func TestStaleTmpManifestIsOverwrittenOnNextWrite(t *testing.T) {
+	dir := t.TempDir()
+
+	tmpPath := filepath.Join(dir, manifestTmpFileName)
+	if err := os.WriteFile(tmpPath, []byte("garbage padding to be truncated"), 0644); err != nil {
+		t.Fatalf("WriteFile tmp: %v", err)
+	}
+
+	if err := writeManifest(dir, &manifest{generation: 1, segments: []int64{1}}); err != nil {
+		t.Fatalf("writeManifest: %v", err)
+	}
+
+	if _, err := os.Stat(tmpPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("tmp should be removed by rename, stat err=%v", err)
+	}
+
+	got, err := readManifest(dir)
+	if err != nil {
+		t.Fatalf("readManifest: %v", err)
+	}
+	if got == nil || got.generation != 1 || !slices.Equal(got.segments, []int64{1}) {
+		t.Fatalf("manifest after overwrite: %+v", got)
+	}
+}
+
 func TestAppendAndReplay(t *testing.T) {
 	dir := t.TempDir()
 	w, err := Open(DefaultOptions(dir))
