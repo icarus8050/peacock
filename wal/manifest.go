@@ -32,9 +32,65 @@ const (
 // ErrManifestCorrupt is returned when the manifest fails structural or CRC validation.
 var ErrManifestCorrupt = errors.New("wal: manifest corrupt")
 
+// ErrMissingSegment is returned when the manifest references a segment file
+// that does not exist on disk. Recovery requires manual intervention so we
+// refuse to start rather than silently scanning the directory.
+var ErrMissingSegment = errors.New("wal: segment referenced by manifest is missing")
+
 type manifest struct {
 	generation uint64
 	segments   []int64
+}
+
+// loadOrInitManifest loads the manifest from dir, verifying that every
+// referenced segment still exists. When no manifest is present (fresh
+// install or pre-manifest deployment), it is initialized from the on-disk
+// segment list and persisted once. Always returns a manifest with at
+// least one segment so callers can derive the active seq.
+//
+// 손상된 매니페스트(ErrManifestCorrupt)는 자동 복구하지 않고 그대로 호출자에
+// 전달한다. 운영자가 원인을 확인한 뒤 수동 개입하도록 한 정책이다.
+func loadOrInitManifest(dir string) (*manifest, error) {
+	m, err := readManifest(dir)
+	if err != nil {
+		return nil, err
+	}
+
+	if m != nil && len(m.segments) > 0 {
+		if err := verifySegmentsExist(dir, m.segments); err != nil {
+			return nil, err
+		}
+		return m, nil
+	}
+
+	diskSeqs, err := listSegments(dir)
+	if err != nil {
+		return nil, fmt.Errorf("wal: list segments: %w", err)
+	}
+	if len(diskSeqs) == 0 {
+		diskSeqs = []int64{1}
+	}
+	var prevGen uint64
+	if m != nil {
+		prevGen = m.generation
+	}
+	next := &manifest{generation: prevGen + 1, segments: diskSeqs}
+	if err := writeManifest(dir, next); err != nil {
+		return nil, err
+	}
+	return next, nil
+}
+
+func verifySegmentsExist(dir string, segments []int64) error {
+	for _, seq := range segments {
+		if _, err := os.Stat(segmentPath(dir, seq)); err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				return fmt.Errorf("%w: seq=%d", ErrMissingSegment, seq)
+			}
+			return fmt.Errorf("wal: stat segment: %w", err)
+		}
+	}
+	return nil
 }
 
 // encode serializes the manifest into the on-disk binary format.

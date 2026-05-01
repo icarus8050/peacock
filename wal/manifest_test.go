@@ -107,4 +107,3 @@ func TestReadManifestMissing(t *testing.T) {
 		t.Fatalf("expected nil, got %+v", got)
 	}
 }
-

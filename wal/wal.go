@@ -19,6 +19,7 @@ type WAL struct {
 	size           int64
 	file           *os.File
 	writer         *bufio.Writer
+	manifest       *manifest
 	closed         bool
 }
 
@@ -29,15 +30,12 @@ func Open(opts Options) (*WAL, error) {
 		return nil, fmt.Errorf("wal: mkdir: %w", err)
 	}
 
-	seqs, err := listSegments(opts.DirPath)
+	m, err := loadOrInitManifest(opts.DirPath)
 	if err != nil {
-		return nil, fmt.Errorf("wal: list segments: %w", err)
-	}
-	var seq int64 = 1
-	if len(seqs) > 0 {
-		seq = seqs[len(seqs)-1]
+		return nil, err
 	}
 
+	seq := m.segments[len(m.segments)-1]
 	file, size, err := openSegment(opts.DirPath, seq)
 	if err != nil {
 		return nil, err
@@ -51,6 +49,7 @@ func Open(opts Options) (*WAL, error) {
 		size:           size,
 		file:           file,
 		writer:         bufio.NewWriterSize(file, opts.BufferSize),
+		manifest:       m,
 	}, nil
 }
 
@@ -78,9 +77,11 @@ func (w *WAL) Append(entry *Entry) error {
 	return err
 }
 
-// rollLocked closes the current segment and opens the next one.
-// close/open 실패 시 WAL은 복구 불가능한 상태가 되므로 closed로 전환한다.
-// 호출자는 WAL을 닫고 재오픈해야 한다.
+// rollLocked closes the current segment and opens the next one. The new
+// segment is recorded in the manifest before the WAL transitions to it so
+// that a crash between roll and the next Append leaves the manifest as the
+// authoritative segment list. close/open/manifest 실패 시 WAL은 복구 불가능한
+// 상태가 되므로 closed로 전환한다. 호출자는 WAL을 닫고 재오픈해야 한다.
 func (w *WAL) rollLocked() error {
 	if err := w.writer.Flush(); err != nil {
 		return fmt.Errorf("wal: flush on roll: %w", err)
@@ -100,10 +101,28 @@ func (w *WAL) rollLocked() error {
 		return fmt.Errorf("wal: open next segment: %w", err)
 	}
 
+	nextSegments := make([]int64, 0, len(w.manifest.segments)+1)
+	nextSegments = append(nextSegments, w.manifest.segments...)
+	nextSegments = append(nextSegments, nextSeq)
+	nextManifest := &manifest{
+		generation: w.manifest.generation + 1,
+		segments:   nextSegments,
+	}
+	if err := writeManifest(w.dir, nextManifest); err != nil {
+		file.Close()
+		// 매니페스트 갱신 실패 — 새 세그먼트 파일은 매니페스트에 기록되지 않은
+		// 고아이며, OpenReader가 디렉터리 스캔으로 잡으면 죽은 세그먼트를 읽게
+		// 된다. 즉시 정리해 매니페스트와 디스크 뷰를 일치시킨다.
+		os.Remove(segmentPath(w.dir, nextSeq))
+		w.closed = true
+		return fmt.Errorf("wal: update manifest on roll: %w", err)
+	}
+
 	w.seq = nextSeq
 	w.size = 0
 	w.file = file
 	w.writer = bufio.NewWriterSize(file, w.bufferSize)
+	w.manifest = nextManifest
 	return nil
 }
 

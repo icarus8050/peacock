@@ -4,6 +4,8 @@ import (
 	"errors"
 	"io"
 	"os"
+	"path/filepath"
+	"slices"
 	"sync"
 	"testing"
 )
@@ -24,6 +26,172 @@ func TestOpenClose(t *testing.T) {
 		t.Fatalf("Reopen: %v", err)
 	}
 	w.Close()
+}
+
+func TestOpenCreatesManifestOnFreshDir(t *testing.T) {
+	dir := t.TempDir()
+	w, err := Open(DefaultOptions(dir))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	t.Cleanup(func() { w.Close() })
+
+	m, err := readManifest(dir)
+	if err != nil {
+		t.Fatalf("readManifest: %v", err)
+	}
+	if m == nil {
+		t.Fatal("expected manifest after Open on fresh dir")
+	}
+	if !slices.Equal(m.segments, []int64{1}) {
+		t.Fatalf("segments: got %v, want [1]", m.segments)
+	}
+}
+
+func TestOpenMigratesPreManifestDir(t *testing.T) {
+	dir := t.TempDir()
+	for _, seq := range []int64{1, 2, 5} {
+		f, err := os.Create(segmentPath(dir, seq))
+		if err != nil {
+			t.Fatalf("create segment %d: %v", seq, err)
+		}
+		f.Close()
+	}
+
+	w, err := Open(DefaultOptions(dir))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	t.Cleanup(func() { w.Close() })
+
+	m, err := readManifest(dir)
+	if err != nil {
+		t.Fatalf("readManifest: %v", err)
+	}
+	if !slices.Equal(m.segments, []int64{1, 2, 5}) {
+		t.Fatalf("segments: got %v, want [1 2 5]", m.segments)
+	}
+	if m.generation != 1 {
+		t.Fatalf("migration should set generation=1, got %d", m.generation)
+	}
+	if w.path() != segmentPath(dir, 5) {
+		t.Fatalf("active segment: got %s, want %s", w.path(), segmentPath(dir, 5))
+	}
+}
+
+func TestRollUpdatesManifest(t *testing.T) {
+	dir := t.TempDir()
+	opts := DefaultOptions(dir)
+	opts.MaxSegmentSize = 80
+
+	w, err := Open(opts)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	for i := 0; i < 5; i++ {
+		e := Entry{Op: OpPut, Index: int64(i), CreatedAt: TimeStamp(i), Data: []byte("v")}
+		if err := w.Append(&e); err != nil {
+			t.Fatalf("Append[%d]: %v", i, err)
+		}
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	diskSeqs, err := listSegments(dir)
+	if err != nil {
+		t.Fatalf("listSegments: %v", err)
+	}
+	if len(diskSeqs) < 2 {
+		t.Fatalf("test setup: need rolling, got %d segments", len(diskSeqs))
+	}
+
+	m, err := readManifest(dir)
+	if err != nil {
+		t.Fatalf("readManifest: %v", err)
+	}
+	if !slices.Equal(m.segments, diskSeqs) {
+		t.Fatalf("manifest segments: got %v, want %v", m.segments, diskSeqs)
+	}
+	// 초기 Open이 generation=1, 이후 롤마다 +1. 활성 세그먼트 수만큼 매니페스트 갱신이 발생한다.
+	if want := uint64(len(diskSeqs)); m.generation != want {
+		t.Fatalf("generation: got %d, want %d (one bump per roll)", m.generation, want)
+	}
+}
+
+func TestRollCleansUpSegmentOnManifestWriteFailure(t *testing.T) {
+	dir := t.TempDir()
+	opts := DefaultOptions(dir)
+	opts.MaxSegmentSize = 80
+
+	w, err := Open(opts)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	t.Cleanup(func() { w.Close() })
+
+	// 매니페스트 tmp 경로를 디렉터리로 점유해 다음 writeManifest의 OpenFile을 실패시킨다.
+	tmpPath := filepath.Join(dir, manifestTmpFileName)
+	if err := os.Mkdir(tmpPath, 0755); err != nil {
+		t.Fatalf("mkdir tmp blocker: %v", err)
+	}
+
+	// 롤이 발생할 때까지 Append. 첫 Append는 빈 세그먼트라 통과, 두 번째에서 롤.
+	for i := 0; i < 5; i++ {
+		e := Entry{Op: OpPut, Index: int64(i), CreatedAt: TimeStamp(i), Data: []byte("v")}
+		err := w.Append(&e)
+		if err != nil {
+			if !errors.Is(err, ErrClosed) && i > 0 {
+				// 첫 실패가 매니페스트 갱신 실패여야 한다.
+				break
+			}
+		}
+	}
+
+	// 새 세그먼트 파일이 디스크에 남지 않아야 한다.
+	if _, err := os.Stat(segmentPath(dir, 2)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("orphan segment should be removed, stat err=%v", err)
+	}
+
+	// 매니페스트는 갱신되지 않았어야 한다 (여전히 [1]).
+	m, err := readManifest(dir)
+	if err != nil {
+		t.Fatalf("readManifest: %v", err)
+	}
+	if !slices.Equal(m.segments, []int64{1}) {
+		t.Fatalf("manifest should remain [1] after failed roll, got %v", m.segments)
+	}
+}
+
+func TestOpenTrustsExistingManifest(t *testing.T) {
+	dir := t.TempDir()
+	w, err := Open(DefaultOptions(dir))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	w.Close()
+
+	before, err := readManifest(dir)
+	if err != nil {
+		t.Fatalf("readManifest before: %v", err)
+	}
+
+	w, err = Open(DefaultOptions(dir))
+	if err != nil {
+		t.Fatalf("Reopen: %v", err)
+	}
+	w.Close()
+
+	after, err := readManifest(dir)
+	if err != nil {
+		t.Fatalf("readManifest after: %v", err)
+	}
+	if after.generation != before.generation {
+		t.Fatalf("generation should be unchanged on consistent reopen: before=%d after=%d", before.generation, after.generation)
+	}
+	if !slices.Equal(after.segments, before.segments) {
+		t.Fatalf("segments should be unchanged: before=%v after=%v", before.segments, after.segments)
+	}
 }
 
 func TestAppendAndReplay(t *testing.T) {
