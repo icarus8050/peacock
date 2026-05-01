@@ -16,15 +16,9 @@ type Reader struct {
 func OpenReader(opts Options) (*Reader, error) {
 	opts = opts.withDefaults()
 
-	seqs, err := listSegments(opts.DirPath)
+	seqs, err := segmentsForRead(opts.DirPath)
 	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return nil, fmt.Errorf("wal: open: %w", os.ErrNotExist)
-		}
-		return nil, fmt.Errorf("wal: list segments: %w", err)
-	}
-	if len(seqs) == 0 {
-		return nil, fmt.Errorf("wal: open: %w", os.ErrNotExist)
+		return nil, err
 	}
 
 	paths := make([]string, len(seqs))

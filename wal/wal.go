@@ -110,9 +110,10 @@ func (w *WAL) rollLocked() error {
 	}
 	if err := writeManifest(w.dir, nextManifest); err != nil {
 		file.Close()
-		// 매니페스트 갱신 실패 — 새 세그먼트 파일은 매니페스트에 기록되지 않은
-		// 고아이며, OpenReader가 디렉터리 스캔으로 잡으면 죽은 세그먼트를 읽게
-		// 된다. 즉시 정리해 매니페스트와 디스크 뷰를 일치시킨다.
+		// 매니페스트 갱신 실패 — 새 세그먼트 파일은 어떤 매니페스트에도 기록되지
+		// 않은 고아다. OpenReader는 매니페스트를 신뢰해 무시하지만, 매니페스트가
+		// 분실되어 다음 Open이 listSegments 마이그레이션 경로를 타면 이 고아가
+		// 정상 세그먼트로 흡수된다. 즉시 정리해 그 위험을 없앤다.
 		os.Remove(segmentPath(w.dir, nextSeq))
 		w.closed = true
 		return fmt.Errorf("wal: update manifest on roll: %w", err)

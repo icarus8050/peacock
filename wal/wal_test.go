@@ -194,6 +194,53 @@ func TestOpenTrustsExistingManifest(t *testing.T) {
 	}
 }
 
+func TestOpenReaderIgnoresOrphanSegment(t *testing.T) {
+	dir := t.TempDir()
+	w, err := Open(DefaultOptions(dir))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	e := Entry{Op: OpPut, Index: 1, CreatedAt: 1, Data: []byte("v")}
+	if err := w.Append(&e); err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	// 매니페스트에 없는 고아 세그먼트를 만들어둔다. OpenReader가 디렉터리 스캔
+	// 대신 매니페스트를 신뢰하면 이 파일은 무시되어 정상 종료해야 한다.
+	if err := os.WriteFile(segmentPath(dir, 99), []byte("garbage"), 0644); err != nil {
+		t.Fatalf("WriteFile orphan: %v", err)
+	}
+
+	// 회귀 시 listSegments fallback이 고아를 잡는다는 전제를 명시.
+	diskSeqs, err := listSegments(dir)
+	if err != nil {
+		t.Fatalf("listSegments: %v", err)
+	}
+	if !slices.Equal(diskSeqs, []int64{1, 99}) {
+		t.Fatalf("test setup: disk seqs got %v, want [1 99]", diskSeqs)
+	}
+
+	r, err := OpenReader(DefaultOptions(dir))
+	if err != nil {
+		t.Fatalf("OpenReader: %v", err)
+	}
+	defer r.Close()
+
+	got, err := r.ReadEntry()
+	if err != nil {
+		t.Fatalf("ReadEntry: %v", err)
+	}
+	if string(got.Data) != "v" {
+		t.Fatalf("data: got %q, want %q", got.Data, "v")
+	}
+	if _, err := r.ReadEntry(); !errors.Is(err, io.EOF) {
+		t.Fatalf("expected io.EOF (orphan ignored), got %v", err)
+	}
+}
+
 func TestAppendAndReplay(t *testing.T) {
 	dir := t.TempDir()
 	w, err := Open(DefaultOptions(dir))

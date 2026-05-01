@@ -49,14 +49,19 @@ type manifest struct {
 // least one segment so callers can derive the active seq.
 //
 // 손상된 매니페스트(ErrManifestCorrupt)는 자동 복구하지 않고 그대로 호출자에
-// 전달한다. 운영자가 원인을 확인한 뒤 수동 개입하도록 한 정책이다.
+// 전달한다. 운영자가 원인을 확인한 뒤 수동 개입하도록 한 정책이다. 빈 segments를
+// 가진 매니페스트는 현 코드가 만들 수 없는 invariant 위반이므로 동일하게 corrupt로
+// 분류한다 — 진짜 마이그레이션 대상은 m == nil(매니페스트 부재)뿐이다.
 func loadOrInitManifest(dir string) (*manifest, error) {
 	m, err := readManifest(dir)
 	if err != nil {
 		return nil, err
 	}
 
-	if m != nil && len(m.segments) > 0 {
+	if m != nil {
+		if len(m.segments) == 0 {
+			return nil, fmt.Errorf("%w: empty segment list", ErrManifestCorrupt)
+		}
 		if err := verifySegmentsExist(dir, m.segments); err != nil {
 			return nil, err
 		}
@@ -70,17 +75,51 @@ func loadOrInitManifest(dir string) (*manifest, error) {
 	if len(diskSeqs) == 0 {
 		diskSeqs = []int64{1}
 	}
-	var prevGen uint64
-	if m != nil {
-		prevGen = m.generation
-	}
-	next := &manifest{generation: prevGen + 1, segments: diskSeqs}
+	next := &manifest{generation: 1, segments: diskSeqs}
 	if err := writeManifest(dir, next); err != nil {
 		return nil, err
 	}
 	return next, nil
 }
 
+// segmentsForRead returns the segment seqs to replay in order. The manifest
+// is the source of truth when present; the directory scan fallback only
+// covers the pre-manifest case (read attempted before any wal.Open ever
+// ran). Corrupt manifest or segments referenced but missing from disk
+// surface as errors — silently scanning around the problem would mask data
+// loss. When neither manifest nor segments exist, returns a wrapped
+// os.ErrNotExist so callers can treat "no log to read" as a single
+// condition.
+func segmentsForRead(dir string) ([]int64, error) {
+	m, err := readManifest(dir)
+	if err != nil {
+		return nil, err
+	}
+	if m != nil {
+		if len(m.segments) == 0 {
+			return nil, fmt.Errorf("%w: empty segment list", ErrManifestCorrupt)
+		}
+		if err := verifySegmentsExist(dir, m.segments); err != nil {
+			return nil, err
+		}
+		return m.segments, nil
+	}
+	seqs, err := listSegments(dir)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, fmt.Errorf("wal: open: %w", os.ErrNotExist)
+		}
+		return nil, fmt.Errorf("wal: list segments: %w", err)
+	}
+	if len(seqs) == 0 {
+		return nil, fmt.Errorf("wal: open: %w", os.ErrNotExist)
+	}
+	return seqs, nil
+}
+
+// verifySegmentsExist는 매니페스트가 참조하는 모든 세그먼트가 디스크에 존재하는지
+// 확인한다. 누락 시 ErrMissingSegment(wrap)로 중단해 매니페스트와 디스크 뷰가
+// 일치하는 상태에서만 진행하도록 강제한다.
 func verifySegmentsExist(dir string, segments []int64) error {
 	for _, seq := range segments {
 		if _, err := os.Stat(segmentPath(dir, seq)); err != nil {
