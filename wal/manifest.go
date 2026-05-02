@@ -14,18 +14,19 @@ const (
 	manifestTmpFileName = "manifest.tmp"
 
 	manifestMagic   = "PCKM"
-	manifestVersion = uint16(1)
+	manifestVersion = uint16(2)
 
-	manifestMagicSize        = 4
-	manifestVersionSize      = 2
-	manifestReservedSize     = 2
-	manifestGenerationSize   = 8
-	manifestSegmentCountSize = 4
-	manifestRecordSize       = 8
-	manifestCRCSize          = 4
+	manifestMagicSize         = 4
+	manifestVersionSize       = 2
+	manifestReservedSize      = 2
+	manifestGenerationSize    = 8
+	manifestCheckpointSeqSize = 8
+	manifestSegmentCountSize  = 4
+	manifestRecordSize        = 8
+	manifestCRCSize           = 4
 
 	manifestHeaderSize = manifestMagicSize + manifestVersionSize + manifestReservedSize +
-		manifestGenerationSize + manifestSegmentCountSize
+		manifestGenerationSize + manifestCheckpointSeqSize + manifestSegmentCountSize
 	manifestMinSize = manifestHeaderSize + manifestCRCSize
 )
 
@@ -38,8 +39,9 @@ var ErrManifestCorrupt = errors.New("wal: manifest corrupt")
 var ErrMissingSegment = errors.New("wal: segment referenced by manifest is missing")
 
 type manifest struct {
-	generation uint64
-	segments   []int64
+	generation    uint64
+	checkpointSeq int64
+	segments      []int64
 }
 
 // loadOrInitManifest loads the manifest from dir, verifying that every
@@ -75,7 +77,7 @@ func loadOrInitManifest(dir string) (*manifest, error) {
 	if len(diskSeqs) == 0 {
 		diskSeqs = []int64{1}
 	}
-	next := &manifest{generation: 1, segments: diskSeqs}
+	next := &manifest{generation: 1, checkpointSeq: 0, segments: diskSeqs}
 	if err := writeManifest(dir, next); err != nil {
 		return nil, err
 	}
@@ -136,7 +138,10 @@ func verifySegmentsExist(dir string, segments []int64) error {
 //
 // Layout (little-endian):
 //
-//	Magic(4) | Version(2) | Reserved(2) | Generation(8) | SegmentCount(4) | Seq(8)... | CRC32(4)
+//	Magic(4) | Version(2) | Reserved(2) | Generation(8) | CheckpointSeq(8) | SegmentCount(4) | Seq(8)... | CRC32(4)
+//
+// CheckpointSeq=0이면 체크포인트 없음. >0이면 wal-NNNNNNNNNN.checkpoint 파일이
+// 매니페스트가 가리키는 segments보다 먼저 replay된다.
 func (m *manifest) encode() []byte {
 	size := manifestHeaderSize + len(m.segments)*manifestRecordSize + manifestCRCSize
 	buf := make([]byte, size)
@@ -150,6 +155,8 @@ func (m *manifest) encode() []byte {
 	off += manifestReservedSize
 	binary.LittleEndian.PutUint64(buf[off:off+manifestGenerationSize], m.generation)
 	off += manifestGenerationSize
+	binary.LittleEndian.PutUint64(buf[off:off+manifestCheckpointSeqSize], uint64(m.checkpointSeq))
+	off += manifestCheckpointSeqSize
 	binary.LittleEndian.PutUint32(buf[off:off+manifestSegmentCountSize], uint32(len(m.segments)))
 	off += manifestSegmentCountSize
 
@@ -189,6 +196,12 @@ func decodeManifest(buf []byte) (*manifest, error) {
 	generation := binary.LittleEndian.Uint64(buf[off : off+manifestGenerationSize])
 	off += manifestGenerationSize
 
+	checkpointSeq := int64(binary.LittleEndian.Uint64(buf[off : off+manifestCheckpointSeqSize]))
+	off += manifestCheckpointSeqSize
+	if checkpointSeq < 0 {
+		return nil, fmt.Errorf("%w: negative checkpointSeq=%d", ErrManifestCorrupt, checkpointSeq)
+	}
+
 	segmentCount := binary.LittleEndian.Uint32(buf[off : off+manifestSegmentCountSize])
 	off += manifestSegmentCountSize
 
@@ -208,7 +221,7 @@ func decodeManifest(buf []byte) (*manifest, error) {
 		return nil, fmt.Errorf("%w: crc mismatch", ErrManifestCorrupt)
 	}
 
-	return &manifest{generation: generation, segments: segments}, nil
+	return &manifest{generation: generation, checkpointSeq: checkpointSeq, segments: segments}, nil
 }
 
 // readManifest loads the manifest from dir. Returns (nil, nil) when the

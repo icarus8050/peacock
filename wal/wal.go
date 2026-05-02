@@ -105,8 +105,9 @@ func (w *WAL) rollLocked() error {
 	nextSegments = append(nextSegments, w.manifest.segments...)
 	nextSegments = append(nextSegments, nextSeq)
 	nextManifest := &manifest{
-		generation: w.manifest.generation + 1,
-		segments:   nextSegments,
+		generation:    w.manifest.generation + 1,
+		checkpointSeq: w.manifest.checkpointSeq,
+		segments:      nextSegments,
 	}
 	if err := writeManifest(w.dir, nextManifest); err != nil {
 		file.Close()

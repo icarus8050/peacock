@@ -10,22 +10,28 @@ import (
 
 func TestManifestEncodeRoundTrip(t *testing.T) {
 	cases := []struct {
-		name     string
-		segments []int64
+		name          string
+		checkpointSeq int64
+		segments      []int64
 	}{
-		{"empty", nil},
-		{"single", []int64{1}},
-		{"many", []int64{1, 2, 5, 100, 1234567890}},
+		{"empty", 0, nil},
+		{"single", 0, []int64{1}},
+		{"many", 0, []int64{1, 2, 5, 100, 1234567890}},
+		{"with-checkpoint", 3, []int64{4}},
+		{"with-checkpoint-many", 7, []int64{8, 9, 10}},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			in := &manifest{generation: 42, segments: c.segments}
+			in := &manifest{generation: 42, checkpointSeq: c.checkpointSeq, segments: c.segments}
 			out, err := decodeManifest(in.encode())
 			if err != nil {
 				t.Fatalf("decodeManifest: %v", err)
 			}
 			if out.generation != in.generation {
 				t.Fatalf("generation: got %d, want %d", out.generation, in.generation)
+			}
+			if out.checkpointSeq != in.checkpointSeq {
+				t.Fatalf("checkpointSeq: got %d, want %d", out.checkpointSeq, in.checkpointSeq)
 			}
 			if !slices.Equal(out.segments, c.segments) {
 				t.Fatalf("segments: got %v, want %v", out.segments, c.segments)
