@@ -191,6 +191,9 @@ func (w *WAL) CommitCompaction(checkpointSeq int64, removedSeqs []int64) error {
 	for _, s := range removedSeqs {
 		os.Remove(segmentPath(w.dir, s))
 	}
+	// 현재 흐름에서는 새 압축이 항상 더 큰 seq를 사용하므로 prev != new가 보장되지만,
+	// 같은 seq가 들어오는 경우(미래 변경) 옛 파일이 곧 새 파일이라 unlink하면 새
+	// 체크포인트까지 사라지므로 가드를 둔다.
 	if prevCheckpointSeq > 0 && prevCheckpointSeq != checkpointSeq {
 		os.Remove(checkpointPath(w.dir, prevCheckpointSeq))
 	}

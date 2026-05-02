@@ -64,15 +64,7 @@ func loadOrInitManifest(dir string) (*manifest, error) {
 	}
 
 	if m != nil {
-		if len(m.segments) == 0 {
-			return nil, fmt.Errorf("%w: empty segment list", ErrManifestCorrupt)
-		}
-		if m.checkpointSeq > 0 {
-			if err := verifyCheckpointExists(dir, m.checkpointSeq); err != nil {
-				return nil, err
-			}
-		}
-		if err := verifySegmentsExist(dir, m.segments); err != nil {
+		if err := verifyManifestArtifacts(dir, m); err != nil {
 			return nil, err
 		}
 		return m, nil
@@ -105,15 +97,7 @@ func pathsForRead(dir string) ([]string, error) {
 		return nil, err
 	}
 	if m != nil {
-		if len(m.segments) == 0 {
-			return nil, fmt.Errorf("%w: empty segment list", ErrManifestCorrupt)
-		}
-		if m.checkpointSeq > 0 {
-			if err := verifyCheckpointExists(dir, m.checkpointSeq); err != nil {
-				return nil, err
-			}
-		}
-		if err := verifySegmentsExist(dir, m.segments); err != nil {
+		if err := verifyManifestArtifacts(dir, m); err != nil {
 			return nil, err
 		}
 		paths := make([]string, 0, len(m.segments)+1)
@@ -144,6 +128,21 @@ func pathsForRead(dir string) ([]string, error) {
 		paths[i] = segmentPath(dir, s)
 	}
 	return paths, nil
+}
+
+// verifyManifestArtifacts는 매니페스트의 invariant와 참조 파일 존재를 검증한다.
+// 같은 정책을 read/write 경로 양쪽이 공유하도록 한 군데로 묶어, 한쪽만 갱신되어
+// 정책 비대칭이 생기는 것을 막는다.
+func verifyManifestArtifacts(dir string, m *manifest) error {
+	if len(m.segments) == 0 {
+		return fmt.Errorf("%w: empty segment list", ErrManifestCorrupt)
+	}
+	if m.checkpointSeq > 0 {
+		if err := verifyCheckpointExists(dir, m.checkpointSeq); err != nil {
+			return err
+		}
+	}
+	return verifySegmentsExist(dir, m.segments)
 }
 
 // verifyCheckpointExists는 매니페스트가 참조하는 체크포인트 파일이 디스크에
