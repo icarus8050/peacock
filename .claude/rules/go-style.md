@@ -50,7 +50,67 @@
 - 가상의 미래 요구사항을 위한 추상화 금지. 세 번 반복될 때까지는 중복을 허용한다.
 - 책임이 혼재된 타입은 분리한다. 예: 로그 기록(`wal.WAL`)과 주기적 동기화(`kv.syncer`)는 분리.
 - 기본값은 `applyDefaults()` 같은 정규화 함수 한 곳에서 관리하거나, `DefaultOptions` 팩토리로 제공한다. 같은 기본값을 여러 곳에 중복해 박지 않는다.
-- 한 함수 내부의 추상화 수준을 맞춘다. 저수준 세부(옵션 필드 조작, 바이트 조립, 플래그 분기 등)와 고수준 흐름(재생·오픈·시작 등)이 한 함수에 섞이면 헬퍼로 추출해 호출부가 한 레벨로 읽히게 한다. 예: `kv.Open`은 옵션 변환 세부를 `walOptionsFrom`으로 감춰 "정규화 → 재생 → 오픈 → 시작" 흐름만 남긴다.
+## 추상화 수준 일치
+
+한 함수 안에서 추상화 레벨을 통일한다. 호출부는 "흐름 한 줄에 한 단계"로 읽혀야 한다.
+
+### 신호 — 분리 검토 대상
+
+- 함수가 **여러 단계**(검증 → 변환 → 영속화 → 정리 등)를 들고 있는데 각 단계가 다른 결정/루프/맵 빌드를 직접 수행한다.
+- 한 함수 안에서 **루프와 흐름이 번갈아** 등장한다 (e.g., `for ... { ... }` 다음 `if ... { ... }` 다음 `for ... { ... }`).
+- 30~40행을 넘어가며 단계 사이 빈 줄로 구분된 블록이 여럿 있다.
+- 인라인 주석으로 단계 경계를 표시해야 읽힌다 (`// 1단계 ...`, `// 다음 ...`).
+
+### 분리 방법
+
+각 단계를 이름 있는 헬퍼로 추출해 호출부가 **단계 이름의 나열**처럼 읽히게 한다. 헬퍼는 가능하면 순수 함수(상태 변경 없음)로 쪼개 단위 테스트 친화적으로.
+
+```go
+// Before: 60행, 5단계가 한 함수에 섞여 있음
+func (w *WAL) CommitCompaction(...) error {
+    w.mu.Lock(); defer w.mu.Unlock()
+    if w.closed { ... }
+    if checkpointSeq <= 0 { ... }
+    if len(removedSeqs) == 0 { ... }
+    sealed := make(map[int64]bool, ...)        // 봉인 검증 시작
+    for _, s := range w.manifest.segments[:len(...)-1] { sealed[s] = true }
+    for _, s := range removedSeqs { if !sealed[s] { ... } }
+    newSegments := make([]int64, 0, ...)        // 새 매니페스트 빌드
+    for _, s := range w.manifest.segments { if !removed[s] { ... } }
+    nextManifest := &manifest{...}
+    if err := writeManifest(...); err != nil { ... }
+    w.manifest = nextManifest
+    for _, s := range removedSeqs { os.Remove(...) }   // 정리
+    if prevCheckpointSeq > 0 && ... { os.Remove(...) }
+    return nil
+}
+
+// After: 흐름 7행, 각 단계는 이름 있는 헬퍼로
+func (w *WAL) CommitCompaction(...) error {
+    w.mu.Lock(); defer w.mu.Unlock()
+    if w.closed { return ErrClosed }
+    if err := validateCompactionArgs(w.manifest, checkpointSeq, removedSeqs); err != nil {
+        return err
+    }
+    prev := w.manifest.checkpointSeq
+    next := postCompactionManifest(w.manifest, checkpointSeq, removedSeqs)
+    if err := writeManifest(w.dir, next); err != nil { w.closed = true; return ... }
+    w.manifest = next
+    cleanupCompactedFiles(w.dir, removedSeqs, prev, checkpointSeq)
+    return nil
+}
+```
+
+### 같이 활용할 패턴
+
+- **저수준 세부의 헬퍼화**: 옵션 변환, 바이트 조립, 플래그 분기 등을 `walOptionsFrom`처럼 추출. `kv.Open`이 옵션 세부를 `walOptionsFrom`으로 감춰 "정규화 → 재생 → 오픈 → 시작" 흐름만 남기는 사례.
+- **상태 접근 메서드화**: `w.manifest.segments[len(...)-1]` 같은 패턴이 두 곳 이상 등장하면 `m.activeSeq()` 같은 메서드로. 의도가 이름에 박혀 호출부가 짧아진다.
+- **헬퍼 위치**: 호출부 바로 아래 또는 같은 파일 말미. 주제별 파일이 따로 있으면(`compact.go` 등) 토픽 친화적 위치 우선.
+
+### 트레이드오프
+
+- 헬퍼 신설 비용 vs jump-to-definition 부담: 헬퍼 이름이 self-explaining이면 호출부에서 점프 안 해도 흐름 이해됨 → 분리 권장.
+- "한 곳에서 다 보고 싶다"는 동기는 함수가 짧을 때만 유효. 30행 이상이면 분리 이득이 거의 항상 큼.
 
 ## Zero Value
 
