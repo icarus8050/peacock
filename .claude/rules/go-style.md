@@ -11,6 +11,21 @@
 - 래핑된 에러 비교는 `errors.Is` / `errors.As`를 사용한다. `err == io.EOF` 같은 직접 비교는 지양한다.
 - 경계(유저 입력, 외부 API) 바깥의 내부 코드에서는 발생 불가능한 경우에 대한 방어적 검증/분기를 추가하지 않는다.
 
+### Close 호출의 에러 처리
+
+위치에 따라 다르다 — 일률적으로 검사하거나 일률적으로 무시하지 않는다.
+
+- **성공 경로의 Close** (영속성 확정 단계, 함수의 마지막 단계 등): **반드시 받는다**. `if err := f.Close(); err != nil { return ... }` 또는 `return f.Close()`. fsync 직후의 close, write 파일을 닫아 저장을 확정하는 경우가 해당.
+- **에러-cleanup 경로의 Close** (이미 메인 에러를 잡은 뒤의 정리): **무시 OK** — 메인 에러를 마스킹하지 않는 Go 표준 관용구. 예:
+  ```go
+  if err := f.Sync(); err != nil {
+      f.Close()  // 무시
+      return fmt.Errorf("wal: fsync: %w", err)
+  }
+  ```
+- **읽기 전용 파일의 `defer Close()`**: **무시 OK**. 버퍼된 쓰기가 없어 Close 실패는 의미 있는 신호를 거의 주지 않고, 호출자가 할 수 있는 일도 없다.
+- 두 에러를 모두 호출자에 노출해야 할 동기가 명확하면 `errors.Join`을 쓴다 (Go 1.20+). 그 외엔 cleanup close 무시가 기본.
+
 ## 인터페이스
 
 - 작은 단일 메서드 인터페이스를 선호한다 (예: `io.Reader`, `fmt.Stringer`).
