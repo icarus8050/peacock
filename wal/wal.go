@@ -148,26 +148,35 @@ func postRollManifest(prev *manifest, newSeq int64) *manifest {
 // 매니페스트 갱신 실패 시 WAL은 복구 불가 상태(closed=true)로 전환되며 호출자는
 // 재오픈해야 한다.
 func (w *WAL) CommitCompaction(checkpointSeq int64, removedSeqs []int64) error {
+	prevCheckpointSeq, err := w.commitCompactionManifest(checkpointSeq, removedSeqs)
+	if err != nil {
+		return err
+	}
+	// 매니페스트 밖의 옛 파일 정리는 정확성에 영향이 없으므로 락 밖에서 수행한다 —
+	// fsync가 끼는 commit critical section을 짧게 유지해 동시 Append 대기를 줄인다.
+	cleanupCompactedFiles(w.dir, removedSeqs, prevCheckpointSeq)
+	return nil
+}
+
+func (w *WAL) commitCompactionManifest(checkpointSeq int64, removedSeqs []int64) (int64, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
 	if w.closed {
-		return ErrClosed
+		return 0, ErrClosed
 	}
 	if err := validateCompactionArgs(w.manifest, checkpointSeq, removedSeqs); err != nil {
-		return err
+		return 0, err
 	}
 
 	prevCheckpointSeq := w.manifest.checkpointSeq
 	next := postCompactionManifest(w.manifest, checkpointSeq, removedSeqs)
 	if err := writeManifest(w.dir, next); err != nil {
 		w.closed = true
-		return fmt.Errorf("wal: commit compaction manifest: %w", err)
+		return 0, fmt.Errorf("wal: commit compaction manifest: %w", err)
 	}
 	w.manifest = next
-
-	cleanupCompactedFiles(w.dir, removedSeqs, prevCheckpointSeq)
-	return nil
+	return prevCheckpointSeq, nil
 }
 
 func (w *WAL) Sync() error {
