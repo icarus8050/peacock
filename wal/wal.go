@@ -136,49 +136,6 @@ func postRollManifest(prev *manifest, newSeq int64) *manifest {
 	}
 }
 
-// CommitCompaction은 압축 결과를 매니페스트에 atomic하게 반영한다.
-// 호출자는 호출 전 checkpointPath(dir, checkpointSeq)에 체크포인트 파일을
-// 작성·fsync 완료한 상태여야 한다.
-//
-// removedSeqs는 새 매니페스트에서 제거할 봉인 segment seq들. 매니페스트 갱신이
-// 성공하면 옛 segment 파일과 옛 체크포인트(이전 generation의 *.checkpoint)도
-// 함께 정리된다 — 정리 실패는 매니페스트 밖이라 정확성 영향이 없으므로 진행을
-// 막지 않는다.
-//
-// 매니페스트 갱신 실패 시 WAL은 복구 불가 상태(closed=true)로 전환되며 호출자는
-// 재오픈해야 한다.
-func (w *WAL) CommitCompaction(checkpointSeq int64, removedSeqs []int64) error {
-	prevCheckpointSeq, err := w.commitCompactionManifest(checkpointSeq, removedSeqs)
-	if err != nil {
-		return err
-	}
-	// 매니페스트 밖의 옛 파일 정리는 정확성에 영향이 없으므로 락 밖에서 수행한다 —
-	// fsync가 끼는 commit critical section을 짧게 유지해 동시 Append 대기를 줄인다.
-	cleanupCompactedFiles(w.dir, removedSeqs, prevCheckpointSeq)
-	return nil
-}
-
-func (w *WAL) commitCompactionManifest(checkpointSeq int64, removedSeqs []int64) (int64, error) {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-
-	if w.closed {
-		return 0, ErrClosed
-	}
-	if err := validateCompactionArgs(w.manifest, checkpointSeq, removedSeqs); err != nil {
-		return 0, err
-	}
-
-	prevCheckpointSeq := w.manifest.checkpointSeq
-	next := postCompactionManifest(w.manifest, checkpointSeq, removedSeqs)
-	if err := writeManifest(w.dir, next); err != nil {
-		w.closed = true
-		return 0, fmt.Errorf("wal: commit compaction manifest: %w", err)
-	}
-	w.manifest = next
-	return prevCheckpointSeq, nil
-}
-
 func (w *WAL) Sync() error {
 	w.mu.Lock()
 	defer w.mu.Unlock()

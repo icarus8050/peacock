@@ -133,6 +133,49 @@ type compactionPlan struct {
 	newCheckpointSeq int64
 }
 
+// CommitCompaction은 압축 결과를 매니페스트에 atomic하게 반영한다.
+// 호출자는 호출 전 checkpointPath(dir, checkpointSeq)에 체크포인트 파일을
+// 작성·fsync 완료한 상태여야 한다.
+//
+// removedSeqs는 새 매니페스트에서 제거할 봉인 segment seq들. 매니페스트 갱신이
+// 성공하면 옛 segment 파일과 옛 체크포인트(이전 generation의 *.checkpoint)도
+// 함께 정리된다 — 정리 실패는 매니페스트 밖이라 정확성 영향이 없으므로 진행을
+// 막지 않는다.
+//
+// 매니페스트 갱신 실패 시 WAL은 복구 불가 상태(closed=true)로 전환되며 호출자는
+// 재오픈해야 한다.
+func (w *WAL) CommitCompaction(checkpointSeq int64, removedSeqs []int64) error {
+	prevCheckpointSeq, err := w.commitCompactionManifest(checkpointSeq, removedSeqs)
+	if err != nil {
+		return err
+	}
+	// 매니페스트 밖의 옛 파일 정리는 정확성에 영향이 없으므로 락 밖에서 수행한다 —
+	// fsync가 끼는 commit critical section을 짧게 유지해 동시 Append 대기를 줄인다.
+	cleanupCompactedFiles(w.dir, removedSeqs, prevCheckpointSeq)
+	return nil
+}
+
+func (w *WAL) commitCompactionManifest(checkpointSeq int64, removedSeqs []int64) (int64, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	if w.closed {
+		return 0, ErrClosed
+	}
+	if err := validateCompactionArgs(w.manifest, checkpointSeq, removedSeqs); err != nil {
+		return 0, err
+	}
+
+	prevCheckpointSeq := w.manifest.checkpointSeq
+	next := postCompactionManifest(w.manifest, checkpointSeq, removedSeqs)
+	if err := writeManifest(w.dir, next); err != nil {
+		w.closed = true
+		return 0, fmt.Errorf("wal: commit compaction manifest: %w", err)
+	}
+	w.manifest = next
+	return prevCheckpointSeq, nil
+}
+
 // Compact는 trigger 임계 도달 시 한 번의 압축 사이클을 수행한다. 옛 체크포인트(있다면)와
 // 봉인 segment를 읽어 keyOf로 dedupe된 키별 최신 상태를 빌드한 뒤 새 체크포인트로
 // atomic하게 교체한다. OpDelete로 끝난 키는 새 체크포인트에서 제외된다.
@@ -149,21 +192,10 @@ func (w *WAL) Compact(trigger int, keyOf func(*Entry) ([]byte, error)) (bool, er
 	}
 	defer w.endCompaction()
 
-	state := make(map[string]Entry)
-	if err := applyCheckpointFile(state, plan.checkpointFile, keyOf); err != nil {
+	entries, err := buildCompactedEntries(plan, keyOf)
+	if err != nil {
 		return false, err
 	}
-	for _, path := range plan.sealedFiles {
-		if err := applySealedSegment(state, path, keyOf); err != nil {
-			return false, err
-		}
-	}
-
-	entries := make([]*Entry, 0, len(state))
-	for _, e := range state {
-		entries = append(entries, &e)
-	}
-
 	if err := WriteCheckpoint(checkpointPath(w.dir, plan.newCheckpointSeq), entries); err != nil {
 		return false, fmt.Errorf("wal: compact write checkpoint: %w", err)
 	}
@@ -171,6 +203,26 @@ func (w *WAL) Compact(trigger int, keyOf func(*Entry) ([]byte, error)) (bool, er
 		return false, err
 	}
 	return true, nil
+}
+
+// buildCompactedEntries는 plan의 옛 체크포인트와 봉인 segment를 keyOf 기준으로
+// dedupe해 새 체크포인트에 쓸 entry 목록을 만든다. OpDelete로 끝난 키는 결과에서
+// 제외된다. 락 밖에서 호출되며 디스크만 읽는다.
+func buildCompactedEntries(plan compactionPlan, keyOf func(*Entry) ([]byte, error)) ([]*Entry, error) {
+	state := make(map[string]Entry)
+	if err := applyCheckpointFile(state, plan.checkpointFile, keyOf); err != nil {
+		return nil, err
+	}
+	for _, path := range plan.sealedFiles {
+		if err := applySealedSegment(state, path, keyOf); err != nil {
+			return nil, err
+		}
+	}
+	entries := make([]*Entry, 0, len(state))
+	for _, e := range state {
+		entries = append(entries, &e)
+	}
+	return entries, nil
 }
 
 // beginCompaction은 락 안에서 매니페스트 스냅샷을 떠 압축 계획을 만든다.
