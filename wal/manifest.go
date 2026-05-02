@@ -84,30 +84,31 @@ func loadOrInitManifest(dir string) (*manifest, error) {
 	return next, nil
 }
 
-// pathsForRead는 replay할 파일 경로 목록을 순서대로 반환한다. 매니페스트가 있으면
-// 그것이 단일 진실원: 체크포인트(있다면)를 먼저, 그 뒤에 segments가 매니페스트
-// 순서대로 따라온다. 매니페스트가 없을 때만 디렉터리 스캔으로 fallback하며
-// 이는 첫 기동/pre-manifest 데이터만 다룬다. 매니페스트 손상, 체크포인트 누락,
-// segment 누락은 모두 에러로 중단한다 — 디렉터리 스캔으로 우회하면 데이터 손실을
-// 가릴 수 있다. 매니페스트도 segment도 없으면 wrapped os.ErrNotExist를 반환해
-// 호출자가 "읽을 로그 없음"을 단일 조건으로 처리할 수 있게 한다.
-func pathsForRead(dir string) ([]string, error) {
+// pathsForRead는 replay에 쓸 체크포인트(있으면)와 segment 경로 목록을 반환한다.
+// 매니페스트가 있으면 그것이 단일 진실원: checkpointSeq > 0이면 그 체크포인트가
+// 가장 먼저 replay되고 이어서 segments가 매니페스트 순서대로 따라온다.
+// 매니페스트가 없을 때만 디렉터리 스캔으로 fallback하며 이는 첫 기동/pre-manifest
+// 데이터만 다룬다. 매니페스트 손상, 체크포인트 누락, segment 누락은 모두 에러로
+// 중단한다 — 디렉터리 스캔으로 우회하면 데이터 손실을 가릴 수 있다. 매니페스트도
+// segment도 없으면 wrapped os.ErrNotExist를 반환해 호출자가 "읽을 로그 없음"을
+// 단일 조건으로 처리할 수 있게 한다.
+func pathsForRead(dir string) (checkpoint string, segments []string, err error) {
 	m, err := readManifest(dir)
 	if err != nil {
-		return nil, err
+		return "", nil, err
 	}
 	if m != nil {
 		if err := verifyManifestArtifacts(dir, m); err != nil {
-			return nil, err
+			return "", nil, err
 		}
-		paths := make([]string, 0, len(m.segments)+1)
 		if m.checkpointSeq > 0 {
-			paths = append(paths, checkpointPath(dir, m.checkpointSeq))
+			checkpoint = checkpointPath(dir, m.checkpointSeq)
 		}
-		for _, s := range m.segments {
-			paths = append(paths, segmentPath(dir, s))
+		segments = make([]string, len(m.segments))
+		for i, s := range m.segments {
+			segments[i] = segmentPath(dir, s)
 		}
-		return paths, nil
+		return checkpoint, segments, nil
 	}
 	// 매니페스트 부재 = 첫 기동 또는 pre-manifest 데이터. 정의상 체크포인트는 매니페스트
 	// commit 후에만 의미를 가지므로 매니페스트 없이 디스크에 *.checkpoint 파일이 떠
@@ -116,18 +117,18 @@ func pathsForRead(dir string) ([]string, error) {
 	seqs, err := listSegments(dir)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			return nil, fmt.Errorf("wal: open: %w", os.ErrNotExist)
+			return "", nil, fmt.Errorf("wal: open: %w", os.ErrNotExist)
 		}
-		return nil, fmt.Errorf("wal: list segments: %w", err)
+		return "", nil, fmt.Errorf("wal: list segments: %w", err)
 	}
 	if len(seqs) == 0 {
-		return nil, fmt.Errorf("wal: open: %w", os.ErrNotExist)
+		return "", nil, fmt.Errorf("wal: open: %w", os.ErrNotExist)
 	}
-	paths := make([]string, len(seqs))
+	segments = make([]string, len(seqs))
 	for i, s := range seqs {
-		paths[i] = segmentPath(dir, s)
+		segments[i] = segmentPath(dir, s)
 	}
-	return paths, nil
+	return "", segments, nil
 }
 
 // verifyManifestArtifacts는 매니페스트의 invariant와 참조 파일 존재를 검증한다.

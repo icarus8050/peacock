@@ -2,10 +2,17 @@ package wal
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 )
+
+// ErrCheckpointCorrupt는 체크포인트 파일에서 부분 entry 또는 CRC mismatch가
+// 감지됐을 때 반환된다. 체크포인트는 atomic write(tmp+rename)로 항상 완전해야
+// 하므로 이런 에러는 segment의 정상 tail truncation과 다른 의미 — 디스크 손상이나
+// 외부 변조로 간주해 호출자가 fatal하게 처리해야 한다.
+var ErrCheckpointCorrupt = errors.New("wal: checkpoint corrupt")
 
 const checkpointSuffix = ".checkpoint"
 

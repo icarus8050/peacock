@@ -9,28 +9,45 @@ import (
 )
 
 type Reader struct {
-	file  *os.File
-	paths []string
+	file         *os.File
+	paths        []string
+	onCheckpoint bool
 }
 
 func OpenReader(opts Options) (*Reader, error) {
 	opts = opts.withDefaults()
 
-	paths, err := pathsForRead(opts.DirPath)
+	checkpoint, segments, err := pathsForRead(opts.DirPath)
 	if err != nil {
 		return nil, err
 	}
 
-	file, err := os.Open(paths[0])
+	first := checkpoint
+	rest := segments
+	onCheckpoint := true
+	if first == "" {
+		first = segments[0]
+		rest = segments[1:]
+		onCheckpoint = false
+	}
+
+	file, err := os.Open(first)
 	if err != nil {
 		return nil, fmt.Errorf("wal: open: %w", err)
 	}
-	return &Reader{file: file, paths: paths[1:]}, nil
+	return &Reader{file: file, paths: rest, onCheckpoint: onCheckpoint}, nil
 }
 
 func (r *Reader) ReadEntry() (Entry, error) {
 	for {
 		entry, err := r.readCurrent()
+		// 체크포인트는 atomic write로 항상 완전해야 한다 — tail-style 에러는
+		// 디스크 손상을 의미하므로 segment의 정상 tail truncation과 구별해 보고한다.
+		if err != nil && r.onCheckpoint {
+			if errors.Is(err, ErrIncompleteEntry) || errors.Is(err, ErrChecksumMismatch) {
+				return Entry{}, fmt.Errorf("%w: %v", ErrCheckpointCorrupt, err)
+			}
+		}
 		if errors.Is(err, io.EOF) && len(r.paths) > 0 {
 			if err := r.advance(); err != nil {
 				return Entry{}, err
@@ -52,6 +69,7 @@ func (r *Reader) advance() error {
 		return fmt.Errorf("wal: open segment: %w", err)
 	}
 	r.file = file
+	r.onCheckpoint = false
 	return nil
 }
 

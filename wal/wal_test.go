@@ -466,6 +466,121 @@ func TestOpenReaderReplaysCheckpointFirst(t *testing.T) {
 	}
 }
 
+func TestOpenReaderDetectsCheckpointTruncation(t *testing.T) {
+	dir := t.TempDir()
+	opts := DefaultOptions(dir)
+	opts.MaxSegmentSize = 80
+
+	w, err := Open(opts)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	for i := 0; i < 5; i++ {
+		if err := w.Append(&Entry{Op: OpPut, Index: int64(i), CreatedAt: TimeStamp(i), Data: []byte("v")}); err != nil {
+			t.Fatalf("Append[%d]: %v", i, err)
+		}
+	}
+	if err := w.Sync(); err != nil {
+		t.Fatalf("Sync: %v", err)
+	}
+	seqs, err := listSegments(dir)
+	if err != nil {
+		t.Fatalf("listSegments: %v", err)
+	}
+	sealed := seqs[:len(seqs)-1]
+	cpSeq := sealed[len(sealed)-1]
+	cpEntries := []*Entry{
+		{Op: OpPut, Index: 100, CreatedAt: 1000, Data: []byte("snap")},
+	}
+	if err := WriteCheckpoint(checkpointPath(dir, cpSeq), cpEntries); err != nil {
+		t.Fatalf("WriteCheckpoint: %v", err)
+	}
+	if err := w.CommitCompaction(cpSeq, sealed); err != nil {
+		t.Fatalf("CommitCompaction: %v", err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	// 체크포인트를 truncate해 부분 entry로 만들기 — atomic write가 깨진 손상 시나리오.
+	cpPath := checkpointPath(dir, cpSeq)
+	info, err := os.Stat(cpPath)
+	if err != nil {
+		t.Fatalf("Stat checkpoint: %v", err)
+	}
+	if err := os.Truncate(cpPath, info.Size()-3); err != nil {
+		t.Fatalf("Truncate: %v", err)
+	}
+
+	r, err := OpenReader(opts)
+	if err != nil {
+		t.Fatalf("OpenReader: %v", err)
+	}
+	defer r.Close()
+
+	if _, err := r.ReadEntry(); !errors.Is(err, ErrCheckpointCorrupt) {
+		t.Fatalf("expected ErrCheckpointCorrupt, got %v", err)
+	}
+}
+
+func TestOpenReaderDetectsCheckpointChecksumMismatch(t *testing.T) {
+	dir := t.TempDir()
+	opts := DefaultOptions(dir)
+	opts.MaxSegmentSize = 80
+
+	w, err := Open(opts)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	for i := 0; i < 5; i++ {
+		if err := w.Append(&Entry{Op: OpPut, Index: int64(i), CreatedAt: TimeStamp(i), Data: []byte("v")}); err != nil {
+			t.Fatalf("Append[%d]: %v", i, err)
+		}
+	}
+	if err := w.Sync(); err != nil {
+		t.Fatalf("Sync: %v", err)
+	}
+	seqs, err := listSegments(dir)
+	if err != nil {
+		t.Fatalf("listSegments: %v", err)
+	}
+	sealed := seqs[:len(seqs)-1]
+	cpSeq := sealed[len(sealed)-1]
+	cpEntries := []*Entry{
+		{Op: OpPut, Index: 100, CreatedAt: 1000, Data: []byte("snap")},
+	}
+	if err := WriteCheckpoint(checkpointPath(dir, cpSeq), cpEntries); err != nil {
+		t.Fatalf("WriteCheckpoint: %v", err)
+	}
+	if err := w.CommitCompaction(cpSeq, sealed); err != nil {
+		t.Fatalf("CommitCompaction: %v", err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	// 첫 entry의 payload 한 바이트를 뒤집어 CRC mismatch 유도.
+	cpPath := checkpointPath(dir, cpSeq)
+	data, err := os.ReadFile(cpPath)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	data[lenSize+crcSize] ^= 0xFF
+	if err := os.WriteFile(cpPath, data, 0644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	r, err := OpenReader(opts)
+	if err != nil {
+		t.Fatalf("OpenReader: %v", err)
+	}
+	defer r.Close()
+
+	if _, err := r.ReadEntry(); !errors.Is(err, ErrCheckpointCorrupt) {
+		t.Fatalf("expected ErrCheckpointCorrupt, got %v", err)
+	}
+}
+
 func TestOpenReaderFailsOnMissingCheckpoint(t *testing.T) {
 	dir := t.TempDir()
 	opts := DefaultOptions(dir)
