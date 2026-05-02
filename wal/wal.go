@@ -128,6 +128,76 @@ func (w *WAL) rollLocked() error {
 	return nil
 }
 
+// CommitCompaction은 압축 결과를 매니페스트에 atomic하게 반영한다.
+// 호출자는 호출 전 checkpointPath(dir, checkpointSeq)에 체크포인트 파일을
+// 작성·fsync 완료한 상태여야 한다.
+//
+// removedSeqs는 새 매니페스트에서 제거할 봉인 segment seq들. 매니페스트 갱신이
+// 성공하면 옛 segment 파일과 옛 체크포인트(이전 generation의 *.checkpoint)도
+// 함께 정리된다 — 정리 실패는 매니페스트 밖이라 정확성 영향이 없으므로 진행을
+// 막지 않는다.
+//
+// 매니페스트 갱신 실패 시 WAL은 복구 불가 상태(closed=true)로 전환되며 호출자는
+// 재오픈해야 한다.
+func (w *WAL) CommitCompaction(checkpointSeq int64, removedSeqs []int64) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	if w.closed {
+		return ErrClosed
+	}
+	if checkpointSeq <= 0 {
+		return fmt.Errorf("wal: commit compaction: invalid checkpointSeq=%d", checkpointSeq)
+	}
+	if len(removedSeqs) == 0 {
+		return fmt.Errorf("wal: commit compaction: removedSeqs empty")
+	}
+
+	// 활성 segment(매니페스트 마지막 원소)는 압축 대상이 아니다 — 봉인부에 속한
+	// seq만 허용. 활성을 제거하면 w.seq/w.file과 매니페스트가 어긋난다.
+	sealed := make(map[int64]bool, len(w.manifest.segments)-1)
+	for _, s := range w.manifest.segments[:len(w.manifest.segments)-1] {
+		sealed[s] = true
+	}
+	removed := make(map[int64]bool, len(removedSeqs))
+	for _, s := range removedSeqs {
+		if !sealed[s] {
+			return fmt.Errorf("wal: commit compaction: seq=%d is not a sealed segment", s)
+		}
+		removed[s] = true
+	}
+	newSegments := make([]int64, 0, len(w.manifest.segments))
+	for _, s := range w.manifest.segments {
+		if !removed[s] {
+			newSegments = append(newSegments, s)
+		}
+	}
+
+	prevCheckpointSeq := w.manifest.checkpointSeq
+	nextManifest := &manifest{
+		generation:    w.manifest.generation + 1,
+		checkpointSeq: checkpointSeq,
+		segments:      newSegments,
+	}
+	if err := writeManifest(w.dir, nextManifest); err != nil {
+		w.closed = true
+		return fmt.Errorf("wal: commit compaction manifest: %w", err)
+	}
+	w.manifest = nextManifest
+
+	// 매니페스트 commit 후의 옛 파일 정리. ENOENT(이미 지워짐, crash 후 재시도 등)와
+	// 그 외 실패 모두 무시 — 매니페스트 밖 상태이므로 정확성 영향 없음. logger 도입
+	// 시 정리 실패만 별도 logging하도록 hook할 자리.
+	for _, s := range removedSeqs {
+		os.Remove(segmentPath(w.dir, s))
+	}
+	if prevCheckpointSeq > 0 && prevCheckpointSeq != checkpointSeq {
+		os.Remove(checkpointPath(w.dir, prevCheckpointSeq))
+	}
+
+	return nil
+}
+
 // Sync flushes the buffer and fsyncs the underlying file.
 func (w *WAL) Sync() error {
 	w.mu.Lock()

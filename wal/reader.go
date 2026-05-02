@@ -16,14 +16,9 @@ type Reader struct {
 func OpenReader(opts Options) (*Reader, error) {
 	opts = opts.withDefaults()
 
-	seqs, err := segmentsForRead(opts.DirPath)
+	paths, err := pathsForRead(opts.DirPath)
 	if err != nil {
 		return nil, err
-	}
-
-	paths := make([]string, len(seqs))
-	for i, s := range seqs {
-		paths[i] = segmentPath(opts.DirPath, s)
 	}
 
 	file, err := os.Open(paths[0])

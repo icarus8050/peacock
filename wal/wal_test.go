@@ -241,6 +241,268 @@ func TestOpenReaderIgnoresOrphanSegment(t *testing.T) {
 	}
 }
 
+func TestCommitCompactionUpdatesManifest(t *testing.T) {
+	dir := t.TempDir()
+	opts := DefaultOptions(dir)
+	opts.MaxSegmentSize = 80
+
+	w, err := Open(opts)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	t.Cleanup(func() { w.Close() })
+
+	for i := 0; i < 5; i++ {
+		e := Entry{Op: OpPut, Index: int64(i), CreatedAt: TimeStamp(i), Data: []byte("v")}
+		if err := w.Append(&e); err != nil {
+			t.Fatalf("Append[%d]: %v", i, err)
+		}
+	}
+	if err := w.Sync(); err != nil {
+		t.Fatalf("Sync: %v", err)
+	}
+
+	seqsBefore, _ := listSegments(dir)
+	if len(seqsBefore) < 2 {
+		t.Fatalf("test setup: need rolling, got %d segments", len(seqsBefore))
+	}
+	active := seqsBefore[len(seqsBefore)-1]
+	sealed := seqsBefore[:len(seqsBefore)-1]
+	checkpointSeq := sealed[len(sealed)-1]
+
+	cpEntry := Entry{Op: OpPut, Index: 999, CreatedAt: 9999, Data: []byte("snapshot")}
+	if err := WriteCheckpoint(checkpointPath(dir, checkpointSeq), []*Entry{&cpEntry}); err != nil {
+		t.Fatalf("WriteCheckpoint: %v", err)
+	}
+
+	if err := w.CommitCompaction(checkpointSeq, sealed); err != nil {
+		t.Fatalf("CommitCompaction: %v", err)
+	}
+
+	m, err := readManifest(dir)
+	if err != nil {
+		t.Fatalf("readManifest: %v", err)
+	}
+	if m.checkpointSeq != checkpointSeq {
+		t.Fatalf("checkpointSeq: got %d, want %d", m.checkpointSeq, checkpointSeq)
+	}
+	if !slices.Equal(m.segments, []int64{active}) {
+		t.Fatalf("segments: got %v, want [%d]", m.segments, active)
+	}
+
+	for _, s := range sealed {
+		if _, err := os.Stat(segmentPath(dir, s)); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("sealed seg %d should be unlinked, stat err=%v", s, err)
+		}
+	}
+}
+
+func TestCommitCompactionRemovesPriorCheckpoint(t *testing.T) {
+	dir := t.TempDir()
+	opts := DefaultOptions(dir)
+	opts.MaxSegmentSize = 80
+
+	w, err := Open(opts)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	t.Cleanup(func() { w.Close() })
+
+	// 첫 압축
+	for i := 0; i < 5; i++ {
+		if err := w.Append(&Entry{Op: OpPut, Index: int64(i), CreatedAt: TimeStamp(i), Data: []byte("v")}); err != nil {
+			t.Fatalf("Append[%d]: %v", i, err)
+		}
+	}
+	if err := w.Sync(); err != nil {
+		t.Fatalf("Sync: %v", err)
+	}
+	seqs1, err := listSegments(dir)
+	if err != nil {
+		t.Fatalf("listSegments: %v", err)
+	}
+	sealed1 := seqs1[:len(seqs1)-1]
+	cp1 := sealed1[len(sealed1)-1]
+	if err := WriteCheckpoint(checkpointPath(dir, cp1), []*Entry{{Op: OpPut, Index: 1, CreatedAt: 1, Data: []byte("snap1")}}); err != nil {
+		t.Fatalf("WriteCheckpoint cp1: %v", err)
+	}
+	if err := w.CommitCompaction(cp1, sealed1); err != nil {
+		t.Fatalf("first CommitCompaction: %v", err)
+	}
+
+	// 추가 append + 두 번째 압축
+	for i := 5; i < 15; i++ {
+		if err := w.Append(&Entry{Op: OpPut, Index: int64(i), CreatedAt: TimeStamp(i), Data: []byte("v")}); err != nil {
+			t.Fatalf("Append[%d]: %v", i, err)
+		}
+	}
+	if err := w.Sync(); err != nil {
+		t.Fatalf("Sync: %v", err)
+	}
+	allSeqs, err := listSegments(dir)
+	if err != nil {
+		t.Fatalf("listSegments: %v", err)
+	}
+	if len(allSeqs) < 2 {
+		t.Fatalf("test setup: need second roll, got %d", len(allSeqs))
+	}
+	sealed2 := allSeqs[:len(allSeqs)-1]
+	cp2 := sealed2[len(sealed2)-1]
+	if err := WriteCheckpoint(checkpointPath(dir, cp2), []*Entry{{Op: OpPut, Index: 2, CreatedAt: 2, Data: []byte("snap2")}}); err != nil {
+		t.Fatalf("WriteCheckpoint cp2: %v", err)
+	}
+	if err := w.CommitCompaction(cp2, sealed2); err != nil {
+		t.Fatalf("second CommitCompaction: %v", err)
+	}
+
+	if _, err := os.Stat(checkpointPath(dir, cp1)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("old checkpoint cp1=%d should be removed, stat err=%v", cp1, err)
+	}
+	if _, err := os.Stat(checkpointPath(dir, cp2)); err != nil {
+		t.Fatalf("new checkpoint cp2=%d missing: %v", cp2, err)
+	}
+}
+
+func TestCommitCompactionRejectsInvalid(t *testing.T) {
+	dir := t.TempDir()
+	opts := DefaultOptions(dir)
+	opts.MaxSegmentSize = 80
+
+	w, err := Open(opts)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	t.Cleanup(func() { w.Close() })
+
+	for i := 0; i < 5; i++ {
+		if err := w.Append(&Entry{Op: OpPut, Index: int64(i), CreatedAt: TimeStamp(i), Data: []byte("v")}); err != nil {
+			t.Fatalf("Append[%d]: %v", i, err)
+		}
+	}
+	if err := w.Sync(); err != nil {
+		t.Fatalf("Sync: %v", err)
+	}
+	seqs, err := listSegments(dir)
+	if err != nil {
+		t.Fatalf("listSegments: %v", err)
+	}
+	if len(seqs) < 2 {
+		t.Fatalf("test setup: need rolling, got %d segments", len(seqs))
+	}
+	active := seqs[len(seqs)-1]
+	sealed := seqs[:len(seqs)-1]
+
+	if err := w.CommitCompaction(0, sealed); err == nil {
+		t.Fatal("expected error for checkpointSeq=0")
+	}
+	if err := w.CommitCompaction(1, nil); err == nil {
+		t.Fatal("expected error for empty removedSeqs")
+	}
+	// 활성 seq를 제거하려 하면 거절. invariant 보호 — newSegments가 비지 않아도 거절돼야 한다.
+	if err := w.CommitCompaction(1, []int64{active}); err == nil {
+		t.Fatal("expected error for active seq in removedSeqs")
+	}
+	// 매니페스트에 없는 seq도 거절.
+	missing := active + 100
+	if err := w.CommitCompaction(1, []int64{missing}); err == nil {
+		t.Fatalf("expected error for non-sealed seq=%d", missing)
+	}
+}
+
+func TestOpenReaderReplaysCheckpointFirst(t *testing.T) {
+	dir := t.TempDir()
+	opts := DefaultOptions(dir)
+	opts.MaxSegmentSize = 80
+
+	w, err := Open(opts)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	for i := 0; i < 5; i++ {
+		if err := w.Append(&Entry{Op: OpPut, Index: int64(i), CreatedAt: TimeStamp(i), Data: []byte("orig")}); err != nil {
+			t.Fatalf("Append[%d]: %v", i, err)
+		}
+	}
+	if err := w.Sync(); err != nil {
+		t.Fatalf("Sync: %v", err)
+	}
+
+	seqs, err := listSegments(dir)
+	if err != nil {
+		t.Fatalf("listSegments: %v", err)
+	}
+	sealed := seqs[:len(seqs)-1]
+	cpSeq := sealed[len(sealed)-1]
+	cpData := []byte("from-checkpoint")
+	if err := WriteCheckpoint(checkpointPath(dir, cpSeq), []*Entry{
+		{Op: OpPut, Index: 100, CreatedAt: 1000, Data: cpData},
+	}); err != nil {
+		t.Fatalf("WriteCheckpoint: %v", err)
+	}
+	if err := w.CommitCompaction(cpSeq, sealed); err != nil {
+		t.Fatalf("CommitCompaction: %v", err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	r, err := OpenReader(opts)
+	if err != nil {
+		t.Fatalf("OpenReader: %v", err)
+	}
+	defer r.Close()
+
+	first, err := r.ReadEntry()
+	if err != nil {
+		t.Fatalf("ReadEntry first: %v", err)
+	}
+	if string(first.Data) != string(cpData) {
+		t.Fatalf("expected checkpoint entry first, got %q", first.Data)
+	}
+}
+
+func TestOpenReaderFailsOnMissingCheckpoint(t *testing.T) {
+	dir := t.TempDir()
+	opts := DefaultOptions(dir)
+	opts.MaxSegmentSize = 80
+
+	w, err := Open(opts)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	for i := 0; i < 5; i++ {
+		if err := w.Append(&Entry{Op: OpPut, Index: int64(i), CreatedAt: TimeStamp(i), Data: []byte("v")}); err != nil {
+			t.Fatalf("Append[%d]: %v", i, err)
+		}
+	}
+	if err := w.Sync(); err != nil {
+		t.Fatalf("Sync: %v", err)
+	}
+	seqs, err := listSegments(dir)
+	if err != nil {
+		t.Fatalf("listSegments: %v", err)
+	}
+	sealed := seqs[:len(seqs)-1]
+	cpSeq := sealed[len(sealed)-1]
+	if err := WriteCheckpoint(checkpointPath(dir, cpSeq), []*Entry{{Op: OpPut, Index: 1, CreatedAt: 1, Data: []byte("v")}}); err != nil {
+		t.Fatalf("WriteCheckpoint: %v", err)
+	}
+	if err := w.CommitCompaction(cpSeq, sealed); err != nil {
+		t.Fatalf("CommitCompaction: %v", err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	if err := os.Remove(checkpointPath(dir, cpSeq)); err != nil {
+		t.Fatalf("Remove checkpoint: %v", err)
+	}
+
+	if _, err := OpenReader(opts); !errors.Is(err, ErrMissingCheckpoint) {
+		t.Fatalf("expected ErrMissingCheckpoint, got %v", err)
+	}
+}
+
 func TestOpenFailsOnMissingSegment(t *testing.T) {
 	dir := t.TempDir()
 	w, err := Open(DefaultOptions(dir))
