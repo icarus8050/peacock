@@ -61,7 +61,7 @@ func TestReadCorruptEntry(t *testing.T) {
 		t.Fatalf("Close: %v", err)
 	}
 
-	// Flip the first payload byte (Op) of the second entry to force a CRC mismatch.
+	// 두 번째 entry의 첫 payload 바이트(Op)를 뒤집어 CRC mismatch 유도.
 	data, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatalf("ReadFile: %v", err)
@@ -110,7 +110,7 @@ func TestReadPartialWrite(t *testing.T) {
 		t.Fatalf("Close: %v", err)
 	}
 
-	// Append a partial TotalLen (only 3 bytes) to simulate a crash.
+	// 부분 TotalLen(3바이트)만 append해 크래시 상황을 시뮬레이션.
 	f, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND, 0644)
 	if err != nil {
 		t.Fatalf("OpenFile: %v", err)
@@ -166,7 +166,7 @@ func TestRecoveryTruncation(t *testing.T) {
 		t.Fatalf("Close: %v", err)
 	}
 
-	// Flip the first payload byte (Op) of the third entry to force a CRC mismatch.
+	// 세 번째 entry의 첫 payload 바이트(Op)를 뒤집어 CRC mismatch 유도.
 	data, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatalf("ReadFile: %v", err)

@@ -9,8 +9,8 @@ import (
 
 const checkpointSuffix = ".checkpoint"
 
-// checkpointName returns the on-disk file name for a checkpoint covering up to
-// seq. 형식은 segment 파일과 동일한 패턴(wal-NNNNNNNNNN)을 쓰되, suffix만 다르게
+// checkpointName은 seq까지를 흡수한 체크포인트의 디스크 파일명을 반환한다.
+// 형식은 segment 파일과 동일한 패턴(wal-NNNNNNNNNN)을 쓰되, suffix만 다르게
 // 두어 디렉터리에서 시각적으로 구별된다.
 func checkpointName(seq int64) string {
 	return fmt.Sprintf("%s%0*d%s", segmentPrefix, segmentDigits, seq, checkpointSuffix)
@@ -20,10 +20,10 @@ func checkpointPath(dir string, seq int64) string {
 	return filepath.Join(dir, checkpointName(seq))
 }
 
-// WriteCheckpoint writes the entries to path using the standard wal.Entry
-// binary format. 정확성은 매니페스트(상위 commit 포인트)가 보장하지만, 최종
-// 경로에 부분 파일이 남지 않도록 tmp+rename 패턴을 사용한다 — 매니페스트 쓰기와
-// 동일한 관용구. 디렉터리 fsync는 후속 writeManifest 단계에서 함께 처리된다.
+// WriteCheckpoint는 entries를 표준 wal.Entry 바이너리 형식으로 path에 쓴다.
+// 정확성은 매니페스트(상위 commit 포인트)가 보장하지만, 최종 경로에 부분 파일이
+// 남지 않도록 tmp+rename 패턴을 사용한다 — 매니페스트 쓰기와 동일한 관용구.
+// 디렉터리 fsync는 후속 writeManifest 단계에서 함께 처리된다.
 //
 // entry 수가 많을 때 syscall 폭증을 막기 위해 bufio.Writer로 사용자 공간에서
 // 배치한다 — WAL.Append와 같은 패턴.

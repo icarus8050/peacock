@@ -84,7 +84,6 @@ func (r *Reader) readCurrent() (Entry, error) {
 	return decodeBody(body)
 }
 
-// Close closes the underlying file.
 func (r *Reader) Close() error {
 	return r.file.Close()
 }

@@ -37,9 +37,9 @@ type Entry struct {
 	Data      []byte
 }
 
-// Encode serializes the entry into the on-disk binary format.
+// Encode는 entry를 디스크 바이너리 형식으로 직렬화한다.
 //
-// Layout (little-endian):
+// 레이아웃 (little-endian):
 //
 //	TotalLen(4) | CRC32(4) | Op(1) | Index(8) | TimeStamp(8) | DataLen(4) | Data(var)
 func (e *Entry) Encode() []byte {
@@ -65,7 +65,6 @@ func (e *Entry) Encode() []byte {
 	return buf
 }
 
-// decodeBody decodes the entry body (CRC + payload), without the TotalLen prefix.
 func decodeBody(body []byte) (Entry, error) {
 	if len(body) < headerSize {
 		return Entry{}, ErrIncompleteEntry

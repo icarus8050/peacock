@@ -9,11 +9,11 @@ import (
 	"peacock/wal"
 )
 
-// replay rebuilds the in-memory map by scanning the WAL described by opts.
-// Tail corruption (torn write or CRC mismatch on the last entries) is
-// treated as the end of the log — earlier entries are still applied.
+// replay는 opts가 가리키는 WAL을 스캔해 인메모리 맵을 복원한다. 마지막 엔트리의
+// tail corruption(torn write 또는 CRC mismatch)은 로그의 끝으로 간주하며, 그
+// 이전까지의 엔트리는 정상 적용된다.
 //
-// Returns the reconstructed map and the next index to assign.
+// 복원된 맵과 다음으로 할당할 index를 반환한다.
 func replay(opts wal.Options) (map[string][]byte, int64, error) {
 	data := make(map[string][]byte)
 	var lastIndex int64 = -1

@@ -30,12 +30,12 @@ const (
 	manifestMinSize = manifestHeaderSize + manifestCRCSize
 )
 
-// ErrManifestCorrupt is returned when the manifest fails structural or CRC validation.
+// ErrManifestCorrupt은 매니페스트의 구조 또는 CRC 검증에 실패했을 때 반환된다.
 var ErrManifestCorrupt = errors.New("wal: manifest corrupt")
 
-// ErrMissingSegment is returned when the manifest references a segment file
-// that does not exist on disk. Recovery requires manual intervention so we
-// refuse to start rather than silently scanning the directory.
+// ErrMissingSegment은 매니페스트가 참조하는 segment 파일이 디스크에 없을 때
+// 반환된다. 복구는 수동 개입을 요하므로 디렉터리 스캔으로 우회하지 않고 기동을
+// 거부한다.
 var ErrMissingSegment = errors.New("wal: segment referenced by manifest is missing")
 
 // ErrMissingCheckpoint은 매니페스트가 체크포인트를 참조(checkpointSeq > 0)하지만
@@ -48,11 +48,10 @@ type manifest struct {
 	segments      []int64
 }
 
-// loadOrInitManifest loads the manifest from dir, verifying that every
-// referenced segment still exists. When no manifest is present (fresh
-// install or pre-manifest deployment), it is initialized from the on-disk
-// segment list and persisted once. Always returns a manifest with at
-// least one segment so callers can derive the active seq.
+// loadOrInitManifest는 dir의 매니페스트를 로드하면서 참조 segment가 모두 디스크에
+// 존재하는지 검증한다. 매니페스트가 없으면(첫 설치 또는 pre-manifest 데이터)
+// 디스크의 segment 목록으로 초기화해 한 번 영속화한다. 항상 최소 1개 segment를
+// 가진 매니페스트를 반환하므로 호출자는 활성 seq를 안전하게 도출할 수 있다.
 //
 // 손상된 매니페스트(ErrManifestCorrupt)는 자동 복구하지 않고 그대로 호출자에
 // 전달한다. 운영자가 원인을 확인한 뒤 수동 개입하도록 한 정책이다. 빈 segments를
@@ -174,9 +173,9 @@ func verifySegmentsExist(dir string, segments []int64) error {
 	return nil
 }
 
-// encode serializes the manifest into the on-disk binary format.
+// encode는 매니페스트를 디스크 바이너리 형식으로 직렬화한다.
 //
-// Layout (little-endian):
+// 레이아웃 (little-endian):
 //
 //	Magic(4) | Version(2) | Reserved(2) | Generation(8) | CheckpointSeq(8) | SegmentCount(4) | Seq(8)... | CRC32(4)
 //
@@ -264,9 +263,8 @@ func decodeManifest(buf []byte) (*manifest, error) {
 	return &manifest{generation: generation, checkpointSeq: checkpointSeq, segments: segments}, nil
 }
 
-// readManifest loads the manifest from dir. Returns (nil, nil) when the
-// manifest file is absent so callers can distinguish "no manifest yet" from
-// real I/O errors.
+// readManifest는 dir의 매니페스트를 로드한다. 매니페스트 파일이 없으면 (nil, nil)을
+// 반환해 호출자가 "매니페스트 없음"을 진짜 I/O 에러와 구별할 수 있게 한다.
 func readManifest(dir string) (*manifest, error) {
 	buf, err := os.ReadFile(filepath.Join(dir, manifestFileName))
 	if errors.Is(err, os.ErrNotExist) {
@@ -278,9 +276,9 @@ func readManifest(dir string) (*manifest, error) {
 	return decodeManifest(buf)
 }
 
-// writeManifest atomically replaces the manifest file via tmp+rename so a
-// crash mid-update never produces a torn file. Recovery relies on POSIX
-// rename atomicity plus a directory fsync to make the rename durable.
+// writeManifest는 tmp+rename으로 매니페스트 파일을 atomic하게 교체해 갱신 도중
+// 크래시가 발생해도 torn file이 남지 않게 한다. 복구는 POSIX rename의 원자성과
+// 디렉터리 fsync로 rename의 영속성을 보장하는 데 의존한다.
 func writeManifest(dir string, m *manifest) error {
 	buf := m.encode()
 	tmpPath := filepath.Join(dir, manifestTmpFileName)

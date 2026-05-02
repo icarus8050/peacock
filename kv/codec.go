@@ -9,9 +9,9 @@ var ErrCorruptPayload = errors.New("kv: corrupt payload")
 
 const keyLenSize = 4
 
-// encodePayload serializes (key, value) into Entry.Data.
+// encodePayload는 (key, value)를 Entry.Data 형식으로 직렬화한다.
 //
-// Layout (little-endian): KeyLen(4) | Key | Value
+// 레이아웃 (little-endian): KeyLen(4) | Key | Value
 func encodePayload(key string, value []byte) []byte {
 	buf := make([]byte, keyLenSize+len(key)+len(value))
 	binary.LittleEndian.PutUint32(buf[0:keyLenSize], uint32(len(key)))

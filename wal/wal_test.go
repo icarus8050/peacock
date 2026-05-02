@@ -20,7 +20,6 @@ func TestOpenClose(t *testing.T) {
 		t.Fatalf("Close: %v", err)
 	}
 
-	// Reopen should work.
 	w, err = Open(DefaultOptions(dir))
 	if err != nil {
 		t.Fatalf("Reopen: %v", err)
@@ -693,7 +692,6 @@ func TestAppendAndReplay(t *testing.T) {
 	path := w.path()
 	w.Close()
 
-	// Replay.
 	r, err := newReader(path)
 	if err != nil {
 		t.Fatal(err)
@@ -726,7 +724,7 @@ func TestAppendWithoutExplicitSync(t *testing.T) {
 	w.Append(&e)
 
 	path := w.path()
-	// Close should flush+sync.
+	// Close가 flush+sync를 수행해야 한다.
 	w.Close()
 
 	r, err := newReader(path)
@@ -798,7 +796,6 @@ func TestConcurrentAppend(t *testing.T) {
 	path := w.path()
 	w.Close()
 
-	// Verify all entries can be read.
 	r, err := newReader(path)
 	if err != nil {
 		t.Fatal(err)

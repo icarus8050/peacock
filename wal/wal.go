@@ -77,11 +77,11 @@ func (w *WAL) Append(entry *Entry) error {
 	return err
 }
 
-// rollLocked closes the current segment and opens the next one. The new
-// segment is recorded in the manifest before the WAL transitions to it so
-// that a crash between roll and the next Append leaves the manifest as the
-// authoritative segment list. close/open/manifest 실패 시 WAL은 복구 불가능한
-// 상태가 되므로 closed로 전환한다. 호출자는 WAL을 닫고 재오픈해야 한다.
+// rollLocked는 현재 segment를 닫고 다음 segment를 연다. WAL이 새 segment로
+// 전환되기 전에 매니페스트에 먼저 기록하므로, roll과 다음 Append 사이에 크래시가
+// 나도 매니페스트가 권위 있는 segment 목록 역할을 한다. close/open/manifest 실패
+// 시 WAL은 복구 불가능한 상태가 되므로 closed로 전환한다. 호출자는 WAL을 닫고
+// 재오픈해야 한다.
 func (w *WAL) rollLocked() error {
 	if err := w.writer.Flush(); err != nil {
 		return fmt.Errorf("wal: flush on roll: %w", err)
@@ -198,7 +198,6 @@ func (w *WAL) CommitCompaction(checkpointSeq int64, removedSeqs []int64) error {
 	return nil
 }
 
-// Sync flushes the buffer and fsyncs the underlying file.
 func (w *WAL) Sync() error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -215,8 +214,8 @@ func (w *WAL) Sync() error {
 	return nil
 }
 
-// Close flushes, syncs, and closes the underlying file. Callers that run
-// a background goroutine calling Sync must stop it before calling Close.
+// Close는 백그라운드 goroutine이 Sync를 호출 중이라면 호출 전에 그 goroutine을
+// 정지시켜야 한다.
 func (w *WAL) Close() error {
 	w.mu.Lock()
 	defer w.mu.Unlock()

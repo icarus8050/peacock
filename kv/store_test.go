@@ -124,7 +124,7 @@ func TestBackgroundSyncPersists(t *testing.T) {
 		t.Fatalf("Put: %v", err)
 	}
 
-	// Wait for the background syncer to flush.
+	// 백그라운드 syncer가 flush할 때까지 대기.
 	time.Sleep(150 * time.Millisecond)
 
 	if err := s.Close(); err != nil {

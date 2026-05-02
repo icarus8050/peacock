@@ -19,8 +19,8 @@ type Store struct {
 	nextIndex int64
 }
 
-// Open recovers the store from the WAL at opts.DirPath and starts a
-// background syncer that fsyncs the WAL on opts.SyncInterval.
+// Open은 opts.DirPath의 WAL로부터 store를 복구하고, opts.SyncInterval 주기로
+// WAL을 fsync하는 백그라운드 syncer를 시작한다.
 func Open(opts Options) (*Store, error) {
 	opts = opts.withDefaults()
 	walOpts := walOptionsFrom(opts)
@@ -65,8 +65,8 @@ func (s *Store) Put(key string, value []byte) error {
 	return nil
 }
 
-// Get returns the value for key. Returns ErrNotFound if the key is absent.
-// The returned slice is a defensive copy and may be mutated by the caller.
+// Get은 키가 없으면 ErrNotFound를 반환한다. 반환되는 슬라이스는 방어 복사본이라
+// 호출자가 수정해도 store 내부 상태에 영향이 없다.
 func (s *Store) Get(key string) ([]byte, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -97,8 +97,8 @@ func (s *Store) Delete(key string) error {
 	return nil
 }
 
-// Close stops the background syncer and closes the underlying WAL, which
-// flushes any buffered writes to disk.
+// Close는 백그라운드 syncer를 정지하고 내부 WAL을 닫는다. WAL 닫기 과정에서
+// 버퍼에 남아있던 쓰기가 디스크로 flush된다.
 func (s *Store) Close() error {
 	s.syncer.stop()
 	return s.wal.Close()

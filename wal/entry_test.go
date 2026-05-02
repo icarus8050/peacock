@@ -53,7 +53,7 @@ func TestDecodeChecksumMismatch(t *testing.T) {
 	e := Entry{Op: OpPut, Index: 5, CreatedAt: 5000, Data: []byte("v")}
 	data := e.Encode()
 
-	// Flip a byte in the payload (after TotalLen + CRC).
+	// payload(TotalLen + CRC 이후)의 한 바이트를 뒤집어 손상 시뮬레이션.
 	data[10] ^= 0xFF
 
 	_, err := decodeEntry(data)
