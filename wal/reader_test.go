@@ -188,7 +188,9 @@ func TestRecoveryTruncation(t *testing.T) {
 		}
 		validCount++
 	}
-	r.Close()
+	if err := r.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
 
 	if validCount != 2 {
 		t.Fatalf("expected 2 valid entries, got %d", validCount)

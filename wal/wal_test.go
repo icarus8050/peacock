@@ -24,7 +24,9 @@ func TestOpenClose(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Reopen: %v", err)
 	}
-	w.Close()
+	if err := w.Close(); err != nil {
+		t.Fatalf("Reopen Close: %v", err)
+	}
 }
 
 func TestOpenCreatesManifestOnFreshDir(t *testing.T) {
@@ -168,7 +170,9 @@ func TestOpenTrustsExistingManifest(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
-	w.Close()
+	if err := w.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
 
 	before, err := readManifest(dir)
 	if err != nil {
@@ -179,7 +183,9 @@ func TestOpenTrustsExistingManifest(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Reopen: %v", err)
 	}
-	w.Close()
+	if err := w.Close(); err != nil {
+		t.Fatalf("Reopen Close: %v", err)
+	}
 
 	after, err := readManifest(dir)
 	if err != nil {
@@ -690,7 +696,9 @@ func TestAppendAndReplay(t *testing.T) {
 		t.Fatalf("Sync: %v", err)
 	}
 	path := w.path()
-	w.Close()
+	if err := w.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
 
 	r, err := newReader(path)
 	if err != nil {
@@ -721,11 +729,15 @@ func TestAppendWithoutExplicitSync(t *testing.T) {
 	}
 
 	e := Entry{Op: OpPut, Index: 1, CreatedAt: 1000, Data: []byte("k:v")}
-	w.Append(&e)
+	if err := w.Append(&e); err != nil {
+		t.Fatalf("Append: %v", err)
+	}
 
 	path := w.path()
 	// Close가 flush+sync를 수행해야 한다.
-	w.Close()
+	if err := w.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
 
 	r, err := newReader(path)
 	if err != nil {
@@ -750,15 +762,25 @@ func TestMultipleAppendSyncCycles(t *testing.T) {
 	}
 
 	e1 := Entry{Op: OpPut, Index: 1, CreatedAt: 1000, Data: []byte("a:1")}
-	w.Append(&e1)
-	w.Sync()
+	if err := w.Append(&e1); err != nil {
+		t.Fatalf("Append e1: %v", err)
+	}
+	if err := w.Sync(); err != nil {
+		t.Fatalf("Sync 1: %v", err)
+	}
 
 	e2 := Entry{Op: OpPut, Index: 2, CreatedAt: 2000, Data: []byte("b:2")}
-	w.Append(&e2)
-	w.Sync()
+	if err := w.Append(&e2); err != nil {
+		t.Fatalf("Append e2: %v", err)
+	}
+	if err := w.Sync(); err != nil {
+		t.Fatalf("Sync 2: %v", err)
+	}
 
 	path := w.path()
-	w.Close()
+	if err := w.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
 
 	r, err := newReader(path)
 	if err != nil {
@@ -787,14 +809,20 @@ func TestConcurrentAppend(t *testing.T) {
 		go func(i int) {
 			defer wg.Done()
 			e := Entry{Op: OpPut, Index: int64(i), CreatedAt: TimeStamp(i), Data: []byte("v")}
-			w.Append(&e)
+			if err := w.Append(&e); err != nil {
+				t.Errorf("Append[%d]: %v", i, err)
+			}
 		}(i)
 	}
 	wg.Wait()
-	w.Sync()
+	if err := w.Sync(); err != nil {
+		t.Fatalf("Sync: %v", err)
+	}
 
 	path := w.path()
-	w.Close()
+	if err := w.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
 
 	r, err := newReader(path)
 	if err != nil {
@@ -901,7 +929,9 @@ func TestReopenAppendsToLatestSegment(t *testing.T) {
 	if w.path() != segmentPath(dir, latest) {
 		t.Fatalf("expected active segment %s, got %s", segmentPath(dir, latest), w.path())
 	}
-	w.Close()
+	if err := w.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
 }
 
 func TestOversizedEntryFitsInOwnSegment(t *testing.T) {
@@ -1113,7 +1143,9 @@ func TestAppendAfterClose(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	w.Close()
+	if err := w.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
 
 	e := Entry{Op: OpPut, Index: 1, CreatedAt: 1000, Data: []byte("k:v")}
 	if err := w.Append(&e); err != ErrClosed {

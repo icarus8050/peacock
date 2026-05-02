@@ -20,6 +20,10 @@
 - 테스트 셋업 단계의 에러는 `t.Fatalf`로 즉시 종료한다.
 - 검증 실패는 `t.Fatalf` 또는 `t.Errorf`. 이후 단언이 의미 없어지면 `Fatalf`, 계속 가능하면 `Errorf`.
 - 기대값과 실제값을 메시지에 포함: `t.Fatalf("expected %v, got %v", want, got)`.
+- **에러를 반환하는 호출은 모두 받는다.** 셋업이든 정리(close)든 무시 금지. 다음 두 패턴이 흔한 누락 지점:
+  - 셋업에서 데이터를 만드는 호출(`Append`/`Sync`/`Put`/`Delete`/`Write`/`CommitCompaction`): silent 실패 시 후속 검증이 비어 있는 결과를 보고 잘못된 진단으로 빠진다 — 반드시 `if err != nil { t.Fatalf(...) }`.
+  - 끝 시점 `Close`: Close 실패는 fsync/durability 실패를 의미할 수 있어 데이터 손실을 가린다 — 반드시 받는다.
+- 고루틴 내부에서는 `t.Fatalf`를 쓸 수 없다 — `t.Errorf`로 기록하고 흐름을 멈추지 않는다(또는 별도 채널로 에러를 모아 메인이 `Fatalf`).
 
 ## 동시성
 
