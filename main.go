@@ -13,11 +13,16 @@ func main() {
 	cfg := config.Load()
 
 	store, err := kv.Open(kv.Options{
-		DirPath:        cfg.KVDir,
-		SyncInterval:   cfg.KVSyncInterval,
-		MaxSegmentSize: cfg.WALMaxSegmentSize,
+		DirPath:            cfg.KVDir,
+		SyncInterval:       cfg.KVSyncInterval,
+		MaxSegmentSize:     cfg.WALMaxSegmentSize,
+		CompactionTrigger:  cfg.KVCompactionTrigger,
+		CompactionInterval: cfg.KVCompactionInterval,
 		OnSyncError: func(err error) {
 			log.Printf("kv: background sync: %v", err)
+		},
+		OnCompactionError: func(err error) {
+			log.Printf("kv: background compaction: %v", err)
 		},
 	})
 	if err != nil {

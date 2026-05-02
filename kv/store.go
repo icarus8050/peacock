@@ -16,6 +16,7 @@ type Store struct {
 	data      map[string][]byte
 	wal       *wal.WAL
 	syncer    *syncer
+	compactor *compactor
 	nextIndex int64
 }
 
@@ -42,6 +43,8 @@ func Open(opts Options) (*Store, error) {
 	}
 	s.syncer = newSyncer(w, opts.SyncInterval, opts.OnSyncError)
 	s.syncer.start()
+	s.compactor = newCompactor(w, opts.CompactionTrigger, opts.CompactionInterval, opts.OnCompactionError)
+	s.compactor.start()
 
 	return s, nil
 }
@@ -97,9 +100,12 @@ func (s *Store) Delete(key string) error {
 	return nil
 }
 
-// Close는 백그라운드 syncer를 정지하고 내부 WAL을 닫는다. WAL 닫기 과정에서
-// 버퍼에 남아있던 쓰기가 디스크로 flush된다.
+// Close는 백그라운드 compactor와 syncer를 차례로 정지한 뒤 내부 WAL을 닫는다.
+// 진행 중인 압축이 있으면 그 사이클이 끝날 때까지 기다리므로 큰 sealed 모음이
+// 있을 경우 Close가 지연될 수 있다. WAL 닫기 과정에서 버퍼에 남아있던 쓰기가
+// 디스크로 flush된다.
 func (s *Store) Close() error {
+	s.compactor.stop()
 	s.syncer.stop()
 	return s.wal.Close()
 }

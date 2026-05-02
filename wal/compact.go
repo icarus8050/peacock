@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 )
@@ -111,12 +112,145 @@ func postCompactionManifest(prev *manifest, checkpointSeq int64, removedSeqs []i
 // 상태이므로 정확성 영향 없음. logger 도입 시 정리 실패만 별도 logging하도록
 // hook할 자리.
 //
-// 새 체크포인트가 옛 것과 같은 seq면 unlink 시 새 파일까지 사라지므로 가드한다.
-func cleanupCompactedFiles(dir string, removedSeqs []int64, prevCheckpointSeq, newCheckpointSeq int64) {
+// invariant: prev checkpointSeq는 그것을 만든 압축 사이클에서 sealed의 max였고
+// 그 사이클이 그 seq를 sealed에서 제거했다. 그러므로 다음 압축의 sealed에 다시
+// 들어올 수 없고 newCheckpointSeq와 절대 같지 않다. 가드는 두지 않는다.
+func cleanupCompactedFiles(dir string, removedSeqs []int64, prevCheckpointSeq int64) {
 	for _, s := range removedSeqs {
 		os.Remove(segmentPath(dir, s))
 	}
-	if prevCheckpointSeq > 0 && prevCheckpointSeq != newCheckpointSeq {
+	if prevCheckpointSeq > 0 {
 		os.Remove(checkpointPath(dir, prevCheckpointSeq))
+	}
+}
+
+// compactionPlan은 압축 시작 시 매니페스트 상태의 스냅샷이다. 호출자는 이 계획에
+// 따라 락 밖에서 파일을 읽고, 결과 entries를 만들어 CommitCompaction을 호출한다.
+type compactionPlan struct {
+	sealedSeqs       []int64
+	sealedFiles      []string
+	checkpointFile   string // 옛 체크포인트 경로 (없으면 빈 문자열)
+	newCheckpointSeq int64
+}
+
+// Compact는 trigger 임계 도달 시 한 번의 압축 사이클을 수행한다. 옛 체크포인트(있다면)와
+// 봉인 segment를 읽어 keyOf로 dedupe된 키별 최신 상태를 빌드한 뒤 새 체크포인트로
+// atomic하게 교체한다. OpDelete로 끝난 키는 새 체크포인트에서 제외된다.
+//
+// trigger 미달이거나 다른 goroutine이 이미 압축 중이면 (false, nil)을 반환하고
+// 아무 것도 하지 않는다 — 동시 호출은 직렬화된다.
+//
+// 모든 키가 OpDelete로 끝났으면 빈 entries로 0바이트 체크포인트를 만들고
+// 매니페스트에 commit한다 (replay 시 EOF로 즉시 다음 segment로 advance).
+func (w *WAL) Compact(trigger int, keyOf func(*Entry) ([]byte, error)) (bool, error) {
+	plan, ok := w.beginCompaction(trigger)
+	if !ok {
+		return false, nil
+	}
+	defer w.endCompaction()
+
+	state := make(map[string]Entry)
+	if err := applyCheckpointFile(state, plan.checkpointFile, keyOf); err != nil {
+		return false, err
+	}
+	for _, path := range plan.sealedFiles {
+		if err := applySealedSegment(state, path, keyOf); err != nil {
+			return false, err
+		}
+	}
+
+	entries := make([]*Entry, 0, len(state))
+	for _, e := range state {
+		entries = append(entries, &e)
+	}
+
+	if err := WriteCheckpoint(checkpointPath(w.dir, plan.newCheckpointSeq), entries); err != nil {
+		return false, fmt.Errorf("wal: compact write checkpoint: %w", err)
+	}
+	if err := w.CommitCompaction(plan.newCheckpointSeq, plan.sealedSeqs); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// beginCompaction은 락 안에서 매니페스트 스냅샷을 떠 압축 계획을 만든다.
+// trigger 미달, 이미 진행 중인 압축이 있거나 closed면 (zero, false).
+func (w *WAL) beginCompaction(trigger int) (compactionPlan, bool) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	if w.closed || w.compacting {
+		return compactionPlan{}, false
+	}
+	sealed := w.manifest.sealedSeqs()
+	if len(sealed) < trigger {
+		return compactionPlan{}, false
+	}
+	w.compacting = true
+	plan := compactionPlan{
+		sealedSeqs:       append([]int64(nil), sealed...),
+		newCheckpointSeq: sealed[len(sealed)-1],
+	}
+	plan.sealedFiles = make([]string, len(sealed))
+	for i, s := range sealed {
+		plan.sealedFiles[i] = segmentPath(w.dir, s)
+	}
+	if w.manifest.checkpointSeq > 0 {
+		plan.checkpointFile = checkpointPath(w.dir, w.manifest.checkpointSeq)
+	}
+	return plan, true
+}
+
+func (w *WAL) endCompaction() {
+	w.mu.Lock()
+	w.compacting = false
+	w.mu.Unlock()
+}
+
+// applyCheckpointFile은 옛 체크포인트의 entries를 state에 적용한다. 체크포인트는
+// atomic write로 항상 완전해야 하므로 어떤 손상도 fatal로 보고된다.
+func applyCheckpointFile(state map[string]Entry, path string, keyOf func(*Entry) ([]byte, error)) error {
+	if path == "" {
+		return nil
+	}
+	return applyFile(state, path, true, keyOf)
+}
+
+// applySealedSegment는 봉인 segment의 entries를 state에 적용한다. tail truncation
+// (ErrIncompleteEntry/ErrChecksumMismatch)은 정상 로그 끝으로 간주 — kv replay와
+// 동일 정책.
+func applySealedSegment(state map[string]Entry, path string, keyOf func(*Entry) ([]byte, error)) error {
+	return applyFile(state, path, false, keyOf)
+}
+
+func applyFile(state map[string]Entry, path string, isCheckpoint bool, keyOf func(*Entry) ([]byte, error)) error {
+	file, err := os.Open(path)
+	if err != nil {
+		return fmt.Errorf("wal: compact open: %w", err)
+	}
+	defer file.Close()
+
+	r := &Reader{file: file, onCheckpoint: isCheckpoint}
+	for {
+		entry, err := r.ReadEntry()
+		if errors.Is(err, io.EOF) {
+			return nil
+		}
+		if !isCheckpoint && (errors.Is(err, ErrIncompleteEntry) || errors.Is(err, ErrChecksumMismatch)) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		key, err := keyOf(&entry)
+		if err != nil {
+			return fmt.Errorf("wal: compact keyOf: %w", err)
+		}
+		switch entry.Op {
+		case OpPut:
+			state[string(key)] = entry
+		case OpDelete:
+			delete(state, string(key))
+		}
 	}
 }

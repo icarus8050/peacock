@@ -21,6 +21,7 @@ type WAL struct {
 	writer         *bufio.Writer
 	manifest       *manifest
 	closed         bool
+	compacting     bool
 }
 
 func Open(opts Options) (*WAL, error) {
@@ -101,14 +102,7 @@ func (w *WAL) rollLocked() error {
 		return fmt.Errorf("wal: open next segment: %w", err)
 	}
 
-	nextSegments := make([]int64, 0, len(w.manifest.segments)+1)
-	nextSegments = append(nextSegments, w.manifest.segments...)
-	nextSegments = append(nextSegments, nextSeq)
-	nextManifest := &manifest{
-		generation:    w.manifest.generation + 1,
-		checkpointSeq: w.manifest.checkpointSeq,
-		segments:      nextSegments,
-	}
+	nextManifest := postRollManifest(w.manifest, nextSeq)
 	if err := writeManifest(w.dir, nextManifest); err != nil {
 		file.Close()
 		// 매니페스트 갱신 실패 — 새 세그먼트 파일은 어떤 매니페스트에도 기록되지
@@ -126,6 +120,20 @@ func (w *WAL) rollLocked() error {
 	w.writer = bufio.NewWriterSize(file, w.bufferSize)
 	w.manifest = nextManifest
 	return nil
+}
+
+// postRollManifest는 prev에 newSeq를 tail에 append한 새 매니페스트를 만든다.
+// generation은 +1, checkpointSeq는 그대로. compact.go의 postCompactionManifest와
+// 짝을 이루며 매니페스트 파생 로직을 한 추상화 수준으로 통일한다.
+func postRollManifest(prev *manifest, newSeq int64) *manifest {
+	segments := make([]int64, 0, len(prev.segments)+1)
+	segments = append(segments, prev.segments...)
+	segments = append(segments, newSeq)
+	return &manifest{
+		generation:    prev.generation + 1,
+		checkpointSeq: prev.checkpointSeq,
+		segments:      segments,
+	}
 }
 
 // CommitCompaction은 압축 결과를 매니페스트에 atomic하게 반영한다.
@@ -158,7 +166,7 @@ func (w *WAL) CommitCompaction(checkpointSeq int64, removedSeqs []int64) error {
 	}
 	w.manifest = next
 
-	cleanupCompactedFiles(w.dir, removedSeqs, prevCheckpointSeq, checkpointSeq)
+	cleanupCompactedFiles(w.dir, removedSeqs, prevCheckpointSeq)
 	return nil
 }
 
