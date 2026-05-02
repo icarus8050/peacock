@@ -5,7 +5,9 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
+	"time"
 )
 
 func TestCheckpointNameFormat(t *testing.T) {
@@ -214,6 +216,170 @@ func TestCompactRespectsDeletes(t *testing.T) {
 	if !keys["k2"] {
 		t.Fatal("k2 should be present")
 	}
+}
+
+func TestOrphanCheckpointIgnoredOnReopen(t *testing.T) {
+	// 시나리오: 압축이 체크포인트 파일을 작성한 직후 매니페스트 갱신 전에 죽음.
+	// 디스크엔 *.checkpoint이 있지만 매니페스트는 옛 상태. 다음 Open은 매니페스트
+	// 신뢰 정책에 따라 고아 체크포인트를 무시하고 옛 segments로 정상 가동해야 한다.
+	dir := t.TempDir()
+	opts := DefaultOptions(dir)
+	opts.MaxSegmentSize = 80
+	w, err := Open(opts)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	for i := 0; i < 5; i++ {
+		if err := w.Append(&Entry{Op: OpPut, Index: int64(i), CreatedAt: TimeStamp(i), Data: []byte("v")}); err != nil {
+			t.Fatalf("Append[%d]: %v", i, err)
+		}
+	}
+	if err := w.Sync(); err != nil {
+		t.Fatalf("Sync: %v", err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	// 매니페스트 갱신 없이 체크포인트 파일만 작성 — 압축이 step 6.2 직전에 죽은 상태.
+	seqs, err := listSegments(dir)
+	if err != nil {
+		t.Fatalf("listSegments: %v", err)
+	}
+	cpSeq := seqs[len(seqs)-2] // 임의 봉인 seq
+	orphan := []*Entry{{Op: OpPut, Index: 999, CreatedAt: 999, Data: []byte("orphan")}}
+	if err := WriteCheckpoint(checkpointPath(dir, cpSeq), orphan); err != nil {
+		t.Fatalf("WriteCheckpoint: %v", err)
+	}
+
+	// 재오픈 — 매니페스트는 여전히 옛 상태이므로 체크포인트는 무시되어야 한다.
+	w2, err := Open(opts)
+	if err != nil {
+		t.Fatalf("Reopen: %v", err)
+	}
+	if w2.manifest.checkpointSeq != 0 {
+		t.Fatalf("expected manifest.checkpointSeq=0 (orphan ignored), got %d", w2.manifest.checkpointSeq)
+	}
+	if err := w2.Close(); err != nil {
+		t.Fatalf("Close 2: %v", err)
+	}
+}
+
+func TestStaleSegmentsIgnoredAfterCompaction(t *testing.T) {
+	// 시나리오: 매니페스트 commit은 끝났지만 cleanupCompactedFiles가 진행되기 전에
+	// 죽음. 옛 봉인 segments가 디스크에 남았지만 새 매니페스트는 그것을 참조하지
+	// 않으므로 OpenReader에 보이지 않아야 한다.
+	dir := t.TempDir()
+	opts := DefaultOptions(dir)
+	opts.MaxSegmentSize = 80
+	w, err := Open(opts)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	t.Cleanup(func() { w.Close() })
+
+	for i := 0; i < 5; i++ {
+		if err := w.Append(&Entry{Op: OpPut, Index: int64(i), CreatedAt: TimeStamp(i), Data: []byte{byte('a' + i)}}); err != nil {
+			t.Fatalf("Append[%d]: %v", i, err)
+		}
+	}
+	if err := w.Sync(); err != nil {
+		t.Fatalf("Sync: %v", err)
+	}
+
+	// 압축 직전 봉인 segments 백업.
+	seqsBefore, err := listSegments(dir)
+	if err != nil {
+		t.Fatalf("listSegments: %v", err)
+	}
+	sealed := seqsBefore[:len(seqsBefore)-1]
+	backups := make(map[int64][]byte)
+	for _, s := range sealed {
+		data, err := os.ReadFile(segmentPath(dir, s))
+		if err != nil {
+			t.Fatalf("ReadFile %d: %v", s, err)
+		}
+		backups[s] = data
+	}
+
+	if ran, err := w.Compact(2, keyOfRaw); err != nil {
+		t.Fatalf("Compact: %v", err)
+	} else if !ran {
+		t.Fatal("expected Compact to run")
+	}
+
+	// cleanup 실패를 시뮬레이션 — 옛 segments를 디스크에 다시 써넣는다.
+	for s, data := range backups {
+		if err := os.WriteFile(segmentPath(dir, s), data, 0644); err != nil {
+			t.Fatalf("restore %d: %v", s, err)
+		}
+	}
+
+	// OpenReader가 매니페스트만 신뢰하면 옛 segments는 보이지 않아야 한다.
+	r, err := OpenReader(opts)
+	if err != nil {
+		t.Fatalf("OpenReader: %v", err)
+	}
+	defer r.Close()
+
+	// 첫 entry는 체크포인트에서 — 옛 봉인 segments의 entry가 leaking 됐다면 체크포인트
+	// entry 외에 추가 entry들이 보일 것이다.
+	count := 0
+	for {
+		_, err := r.ReadEntry()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			t.Fatalf("ReadEntry: %v", err)
+		}
+		count++
+	}
+	// state는 5개 키(a..e). 활성 segment는 비어 있을 수 있고 체크포인트만 있을 가능성.
+	// 옛 봉인 segments(각 1+개 entry)가 보였다면 count가 5보다 훨씬 클 것.
+	if count > 5 {
+		t.Fatalf("orphan segments leaked into replay: count=%d (want ≤5)", count)
+	}
+}
+
+func TestConcurrentAppendAndCompact(t *testing.T) {
+	dir := t.TempDir()
+	opts := DefaultOptions(dir)
+	opts.MaxSegmentSize = 100
+	w, err := Open(opts)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	t.Cleanup(func() { w.Close() })
+
+	const n = 200
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	// Writer
+	go func() {
+		defer wg.Done()
+		for i := 0; i < n; i++ {
+			if err := w.Append(&Entry{Op: OpPut, Index: int64(i), CreatedAt: TimeStamp(i), Data: []byte{byte(i % 256)}}); err != nil {
+				t.Errorf("Append[%d]: %v", i, err)
+				return
+			}
+		}
+	}()
+
+	// Compactor — 짧은 간격으로 반복 시도.
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 20; i++ {
+			if _, err := w.Compact(2, keyOfRaw); err != nil {
+				t.Errorf("Compact: %v", err)
+				return
+			}
+			time.Sleep(time.Millisecond)
+		}
+	}()
+
+	wg.Wait()
 }
 
 func TestWriteCheckpointOverwritesExisting(t *testing.T) {
