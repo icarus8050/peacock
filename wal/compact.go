@@ -63,3 +63,60 @@ func WriteCheckpoint(path string, entries []*Entry) error {
 	}
 	return nil
 }
+
+// validateCompactionArgs는 압축 commit 입력의 유효성을 검사한다. 활성 segment를
+// 제거 대상에 포함하면 w.seq/w.file과 매니페스트가 어긋나므로 봉인부 seq만 허용한다.
+func validateCompactionArgs(m *manifest, checkpointSeq int64, removedSeqs []int64) error {
+	if checkpointSeq <= 0 {
+		return fmt.Errorf("wal: commit compaction: invalid checkpointSeq=%d", checkpointSeq)
+	}
+	if len(removedSeqs) == 0 {
+		return fmt.Errorf("wal: commit compaction: removedSeqs empty")
+	}
+	sealed := m.sealedSeqs()
+	sealedSet := make(map[int64]bool, len(sealed))
+	for _, s := range sealed {
+		sealedSet[s] = true
+	}
+	for _, s := range removedSeqs {
+		if !sealedSet[s] {
+			return fmt.Errorf("wal: commit compaction: seq=%d is not a sealed segment", s)
+		}
+	}
+	return nil
+}
+
+// postCompactionManifest는 prev에서 removedSeqs를 빼고 checkpointSeq를 갱신한
+// 새 매니페스트를 만든다. generation은 +1.
+func postCompactionManifest(prev *manifest, checkpointSeq int64, removedSeqs []int64) *manifest {
+	removed := make(map[int64]bool, len(removedSeqs))
+	for _, s := range removedSeqs {
+		removed[s] = true
+	}
+	next := make([]int64, 0, len(prev.segments))
+	for _, s := range prev.segments {
+		if !removed[s] {
+			next = append(next, s)
+		}
+	}
+	return &manifest{
+		generation:    prev.generation + 1,
+		checkpointSeq: checkpointSeq,
+		segments:      next,
+	}
+}
+
+// cleanupCompactedFiles는 매니페스트 commit 후의 옛 파일 정리를 수행한다.
+// ENOENT(이미 지워짐, crash 후 재시도 등)와 그 외 실패 모두 무시 — 매니페스트 밖
+// 상태이므로 정확성 영향 없음. logger 도입 시 정리 실패만 별도 logging하도록
+// hook할 자리.
+//
+// 새 체크포인트가 옛 것과 같은 seq면 unlink 시 새 파일까지 사라지므로 가드한다.
+func cleanupCompactedFiles(dir string, removedSeqs []int64, prevCheckpointSeq, newCheckpointSeq int64) {
+	for _, s := range removedSeqs {
+		os.Remove(segmentPath(dir, s))
+	}
+	if prevCheckpointSeq > 0 && prevCheckpointSeq != newCheckpointSeq {
+		os.Remove(checkpointPath(dir, prevCheckpointSeq))
+	}
+}

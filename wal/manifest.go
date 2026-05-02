@@ -48,6 +48,16 @@ type manifest struct {
 	segments      []int64
 }
 
+// activeSeq는 현재 활성 segment seq를 반환한다 — invariant상 매니페스트 마지막 원소.
+func (m *manifest) activeSeq() int64 {
+	return m.segments[len(m.segments)-1]
+}
+
+// sealedSeqs는 봉인된(활성 제외) segment seq 슬라이스를 반환한다.
+func (m *manifest) sealedSeqs() []int64 {
+	return m.segments[:len(m.segments)-1]
+}
+
 // loadOrInitManifest는 dir의 매니페스트를 로드하면서 참조 segment가 모두 디스크에
 // 존재하는지 검증한다. 매니페스트가 없으면(첫 설치 또는 pre-manifest 데이터)
 // 디스크의 segment 목록으로 초기화해 한 번 영속화한다. 항상 최소 1개 segment를

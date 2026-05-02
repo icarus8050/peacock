@@ -35,7 +35,7 @@ func Open(opts Options) (*WAL, error) {
 		return nil, err
 	}
 
-	seq := m.segments[len(m.segments)-1]
+	seq := m.activeSeq()
 	file, size, err := openSegment(opts.DirPath, seq)
 	if err != nil {
 		return nil, err
@@ -146,58 +146,19 @@ func (w *WAL) CommitCompaction(checkpointSeq int64, removedSeqs []int64) error {
 	if w.closed {
 		return ErrClosed
 	}
-	if checkpointSeq <= 0 {
-		return fmt.Errorf("wal: commit compaction: invalid checkpointSeq=%d", checkpointSeq)
-	}
-	if len(removedSeqs) == 0 {
-		return fmt.Errorf("wal: commit compaction: removedSeqs empty")
-	}
-
-	// 활성 segment(매니페스트 마지막 원소)는 압축 대상이 아니다 — 봉인부에 속한
-	// seq만 허용. 활성을 제거하면 w.seq/w.file과 매니페스트가 어긋난다.
-	sealed := make(map[int64]bool, len(w.manifest.segments)-1)
-	for _, s := range w.manifest.segments[:len(w.manifest.segments)-1] {
-		sealed[s] = true
-	}
-	removed := make(map[int64]bool, len(removedSeqs))
-	for _, s := range removedSeqs {
-		if !sealed[s] {
-			return fmt.Errorf("wal: commit compaction: seq=%d is not a sealed segment", s)
-		}
-		removed[s] = true
-	}
-	newSegments := make([]int64, 0, len(w.manifest.segments))
-	for _, s := range w.manifest.segments {
-		if !removed[s] {
-			newSegments = append(newSegments, s)
-		}
+	if err := validateCompactionArgs(w.manifest, checkpointSeq, removedSeqs); err != nil {
+		return err
 	}
 
 	prevCheckpointSeq := w.manifest.checkpointSeq
-	nextManifest := &manifest{
-		generation:    w.manifest.generation + 1,
-		checkpointSeq: checkpointSeq,
-		segments:      newSegments,
-	}
-	if err := writeManifest(w.dir, nextManifest); err != nil {
+	next := postCompactionManifest(w.manifest, checkpointSeq, removedSeqs)
+	if err := writeManifest(w.dir, next); err != nil {
 		w.closed = true
 		return fmt.Errorf("wal: commit compaction manifest: %w", err)
 	}
-	w.manifest = nextManifest
+	w.manifest = next
 
-	// 매니페스트 commit 후의 옛 파일 정리. ENOENT(이미 지워짐, crash 후 재시도 등)와
-	// 그 외 실패 모두 무시 — 매니페스트 밖 상태이므로 정확성 영향 없음. logger 도입
-	// 시 정리 실패만 별도 logging하도록 hook할 자리.
-	for _, s := range removedSeqs {
-		os.Remove(segmentPath(w.dir, s))
-	}
-	// 현재 흐름에서는 새 압축이 항상 더 큰 seq를 사용하므로 prev != new가 보장되지만,
-	// 같은 seq가 들어오는 경우(미래 변경) 옛 파일이 곧 새 파일이라 unlink하면 새
-	// 체크포인트까지 사라지므로 가드를 둔다.
-	if prevCheckpointSeq > 0 && prevCheckpointSeq != checkpointSeq {
-		os.Remove(checkpointPath(w.dir, prevCheckpointSeq))
-	}
-
+	cleanupCompactedFiles(w.dir, removedSeqs, prevCheckpointSeq, checkpointSeq)
 	return nil
 }
 
