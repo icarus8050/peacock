@@ -92,12 +92,16 @@ func Open(opts Options) (*Log, error) {
 // 갱신을 결정하게 한다.
 func (l *Log) replaySegments() (stale bool, err error) {
 	for i, sm := range l.manifest.segments {
-		isActive := i == len(l.manifest.segments)-1
-		ss, truncated, err := scanSegment(l.dir, sm, isActive)
+		target := scanTarget{
+			path:     segmentPath(l.dir, sm.seq),
+			seq:      sm.seq,
+			isActive: i == len(l.manifest.segments)-1,
+		}
+		ss, truncated, err := scanSegment(target)
 		if err != nil {
 			return false, err
 		}
-		if !isActive {
+		if !target.isActive {
 			if err := verifySealedMeta(sm, ss); err != nil {
 				return false, err
 			}
@@ -678,18 +682,33 @@ func verifySealedMeta(sm segmentMeta, ss *segState) error {
 		sm.firstIndex, sm.lastIndex, sm.size)
 }
 
-// scanSegment는 디스크에서 segment를 읽어 segState를 채운다.
-// isActive=true이면 tail corruption(부분 entry, CRC 오류)을 정상 종료의 signal로
+// scanTarget은 스캔 대상 segment의 정체성과 맥락을 표현한다 — 파일 위치, 식별자,
+// 매니페스트 상의 역할(활성/봉인). 한 단위로 묶여 깊은 콜 체인을 흐른다.
+type scanTarget struct {
+	path     string // segment 파일 경로
+	seq      int64  // segment seq (에러 메시지 식별자)
+	isActive bool   // 활성/봉인 정책 분기 (tail 손상 처리)
+}
+
+type scanResult int
+
+const (
+	scanOK scanResult = iota
+	scanEOF
+	scanTailDamage
+)
+
+// scanSegment는 target.path의 segment 파일을 읽어 segState를 채운다.
+// target.isActive=true이면 tail corruption(부분 entry, CRC 오류)을 정상 종료의 signal로
 // 보고 그 지점에서 절단한다 — 절단된 size를 호출자에 알려 매니페스트 갱신을 유도.
-// isActive=false면 corruption은 fatal.
-func scanSegment(dir string, sm segmentMeta, isActive bool) (*segState, bool, error) {
-	path := segmentPath(dir, sm.seq)
-	ss, truncated, err := readSegmentEntries(path, sm, isActive)
+// false면 corruption은 fatal.
+func scanSegment(target scanTarget) (*segState, bool, error) {
+	ss, truncated, err := readSegmentEntries(target)
 	if err != nil {
 		return nil, false, err
 	}
 	if truncated {
-		if err := truncateTailTo(path, ss.size); err != nil {
+		if err := truncateTailTo(target.path, ss.size); err != nil {
 			return nil, false, err
 		}
 	}
@@ -699,19 +718,19 @@ func scanSegment(dir string, sm segmentMeta, isActive bool) (*segState, bool, er
 // readSegmentEntries는 segment 파일을 처음부터 읽어 인메모리 segState를 만든다.
 // 활성 segment에서 tail corruption이 감지되면 truncated=true로 알리고 그 지점까지의
 // 결과를 반환한다 — 디스크 파일 절단은 호출자(scanSegment)가 수행.
-func readSegmentEntries(path string, sm segmentMeta, isActive bool) (*segState, bool, error) {
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDONLY, 0644)
+func readSegmentEntries(target scanTarget) (*segState, bool, error) {
+	f, err := os.OpenFile(target.path, os.O_CREATE|os.O_RDONLY, 0644)
 	if err != nil {
 		return nil, false, fmt.Errorf("raftlog: open segment for scan: %w", err)
 	}
 	defer f.Close()
 
 	br := bufio.NewReader(f)
-	ss := &segState{seq: sm.seq}
+	ss := &segState{seq: target.seq}
 	var off int64
 
 	for {
-		entry, encoded, result, err := readNextEntry(br, sm, off, isActive)
+		entry, encoded, result, err := readNextEntry(br, target, off)
 		if err != nil {
 			return nil, false, err
 		}
@@ -732,58 +751,59 @@ func readSegmentEntries(path string, sm segmentMeta, isActive bool) (*segState, 
 	}
 }
 
-type scanResult int
-
-const (
-	scanOK scanResult = iota
-	scanEOF
-	scanTailDamage
-)
-
 // readNextEntry는 br에서 다음 entry 하나를 읽어 분류한다.
 //   - scanOK: entry/encoded가 유효, 호출자가 누적
 //   - scanEOF: 정상 EOF (tail truncation 아님)
 //   - scanTailDamage: 활성 segment의 tail corruption (header/body 절단 또는 CRC 오류)
 //
 // 봉인 segment에서 동일한 손상이 보이면 fatal 에러로 반환한다.
-func readNextEntry(br *bufio.Reader, sm segmentMeta, off int64, isActive bool) (Entry, int, scanResult, error) {
+func readNextEntry(br *bufio.Reader, target scanTarget, off int64) (Entry, int, scanResult, error) {
 	var lenBuf [lenSize]byte
-	if _, err := io.ReadFull(br, lenBuf[:]); err != nil {
-		if errors.Is(err, io.EOF) {
-			return Entry{}, 0, scanEOF, nil
-		}
-		if errors.Is(err, io.ErrUnexpectedEOF) {
-			return tailOrSealed(isActive, sm, off, "truncated header", nil)
-		}
-		return Entry{}, 0, 0, fmt.Errorf("raftlog: read length: %w", err)
+	_, err := io.ReadFull(br, lenBuf[:])
+	if errors.Is(err, io.EOF) {
+		return noEntry(scanEOF, nil)
+	}
+	if errors.Is(err, io.ErrUnexpectedEOF) {
+		return noEntry(tailOrSealed(target, off, "truncated header", nil))
+	}
+	if err != nil {
+		return noEntry(0, fmt.Errorf("raftlog: read length: %w", err))
 	}
 	totalLen := binary.LittleEndian.Uint32(lenBuf[:])
 
 	body := make([]byte, totalLen)
 	if _, err := io.ReadFull(br, body); err != nil {
-		return tailOrSealed(isActive, sm, off, "truncated body", nil)
+		return noEntry(tailOrSealed(target, off, "truncated body", nil))
 	}
 
 	entry, err := decodeBody(body)
+	if errors.Is(err, ErrChecksumMismatch) || errors.Is(err, ErrIncompleteEntry) {
+		return noEntry(tailOrSealed(target, off, "corrupt entry", err))
+	}
 	if err != nil {
-		if errors.Is(err, ErrChecksumMismatch) || errors.Is(err, ErrIncompleteEntry) {
-			return tailOrSealed(isActive, sm, off, "corrupt entry", err)
-		}
-		return Entry{}, 0, 0, err
+		return noEntry(0, err)
 	}
 	return entry, lenSize + int(totalLen), scanOK, nil
 }
 
+// noEntry는 readNextEntry의 실패/종료 분기에서 entry/encoded 자리에 zero를 채워
+// (Entry, int, scanResult, error) 4-tuple을 만드는 어댑터. 호출부에서 매번
+// `Entry{}, 0`을 반복하지 않도록 한 곳에 모은다.
+func noEntry(r scanResult, err error) (Entry, int, scanResult, error) {
+	return Entry{}, 0, r, err
+}
+
 // tailOrSealed는 tail-style 손상에 대한 정책 분기를 한 곳으로 모은다 — 활성이면
-// scanTailDamage로 정상 종료, 봉인이면 fatal 에러.
-func tailOrSealed(isActive bool, sm segmentMeta, off int64, msg string, src error) (Entry, int, scanResult, error) {
-	if isActive {
-		return Entry{}, 0, scanTailDamage, nil
+// scanTailDamage로 정상 종료, 봉인이면 fatal 에러. 결과 값(scanResult)은 err == nil
+// 일 때만 의미 있다.
+func tailOrSealed(target scanTarget, off int64, msg string, src error) (scanResult, error) {
+	if target.isActive {
+		return scanTailDamage, nil
 	}
 	if src == nil {
-		return Entry{}, 0, 0, fmt.Errorf("raftlog: sealed segment seq=%d %s at %d", sm.seq, msg, off)
+		return 0, fmt.Errorf("raftlog: sealed segment seq=%d %s at %d", target.seq, msg, off)
 	}
-	return Entry{}, 0, 0, fmt.Errorf("raftlog: sealed segment seq=%d %s at %d: %w", sm.seq, msg, off, src)
+	return 0, fmt.Errorf("raftlog: sealed segment seq=%d %s at %d: %w", target.seq, msg, off, src)
 }
 
 // truncateTailTo는 활성 segment의 디스크 파일을 size 바이트로 절단해 다음 Append가
