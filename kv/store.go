@@ -26,7 +26,7 @@ func Open(opts Options) (*Store, error) {
 	opts = opts.withDefaults()
 	walOpts := walOptionsFrom(opts)
 
-	data, nextIndex, err := replay(walOpts)
+	replayed, err := replay(walOpts)
 	if err != nil {
 		return nil, err
 	}
@@ -37,9 +37,9 @@ func Open(opts Options) (*Store, error) {
 	}
 
 	s := &Store{
-		data:      data,
+		data:      replayed.data,
 		wal:       w,
-		nextIndex: nextIndex,
+		nextIndex: replayed.nextIndex,
 	}
 	s.syncer = newSyncer(w, opts.SyncInterval, opts.OnSyncError)
 	s.syncer.start()

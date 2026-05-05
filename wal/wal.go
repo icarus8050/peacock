@@ -131,11 +131,18 @@ func (w *WAL) rollLocked() error {
 	if err := w.closeActiveForRollLocked(); err != nil {
 		return err
 	}
-	file, nextSeq, err := w.openNextSegmentLocked()
+	ns, err := w.openNextSegmentLocked()
 	if err != nil {
 		return err
 	}
-	return w.commitRollLocked(file, nextSeq)
+	return w.commitRollLocked(ns)
+}
+
+// nextSegment는 막 열린 새 segment의 정체성 — 파일 핸들과 그 seq. commit 단계까지
+// 같이 흐른다.
+type nextSegment struct {
+	file *os.File
+	seq  int64
 }
 
 // closeActiveForRollLocked는 현재 활성 segment의 buffered write를 비우고 fsync 후
@@ -156,32 +163,32 @@ func (w *WAL) closeActiveForRollLocked() error {
 
 // openNextSegmentLocked는 다음 seq의 segment 파일을 새로 만들어 연다.
 // 아직 매니페스트에 등록되지 않은 고아 상태 — commit은 commitRollLocked가 수행.
-func (w *WAL) openNextSegmentLocked() (*os.File, int64, error) {
+func (w *WAL) openNextSegmentLocked() (nextSegment, error) {
 	nextSeq := w.seq + 1
 	file, err := os.OpenFile(segmentPath(w.dir, nextSeq), os.O_CREATE|os.O_RDWR|os.O_APPEND, 0644)
 	if err != nil {
 		w.closed = true
-		return nil, 0, fmt.Errorf("wal: open next segment: %w", err)
+		return nextSegment{}, fmt.Errorf("wal: open next segment: %w", err)
 	}
-	return file, nextSeq, nil
+	return nextSegment{file: file, seq: nextSeq}, nil
 }
 
 // commitRollLocked는 매니페스트에 먼저 기록한 뒤 인메모리 state를 갱신한다 —
 // persist 실패 시 state는 손대지 않으므로 rollback 불필요. 매니페스트 갱신 실패는
 // 복구 불가이므로 새 segment 파일을 정리하고 WAL을 closed로 전환한다 — 매니페스트
 // 분실 후 listSegments 마이그레이션이 고아를 정상 segment로 흡수하는 위험을 없앤다.
-func (w *WAL) commitRollLocked(file *os.File, nextSeq int64) error {
-	nextManifest := postRollManifest(w.manifest, nextSeq)
+func (w *WAL) commitRollLocked(ns nextSegment) error {
+	nextManifest := postRollManifest(w.manifest, ns.seq)
 	if err := writeManifest(w.dir, nextManifest); err != nil {
-		file.Close()
-		os.Remove(segmentPath(w.dir, nextSeq))
+		ns.file.Close()
+		os.Remove(segmentPath(w.dir, ns.seq))
 		w.closed = true
 		return fmt.Errorf("wal: update manifest on roll: %w", err)
 	}
-	w.seq = nextSeq
+	w.seq = ns.seq
 	w.size = 0
-	w.file = file
-	w.writer = bufio.NewWriterSize(file, w.bufferSize)
+	w.file = ns.file
+	w.writer = bufio.NewWriterSize(ns.file, w.bufferSize)
 	w.manifest = nextManifest
 	return nil
 }

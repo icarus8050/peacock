@@ -17,17 +17,17 @@ type Reader struct {
 func OpenReader(opts Options) (*Reader, error) {
 	opts = opts.withDefaults()
 
-	checkpoint, segments, err := pathsForRead(opts.DirPath)
+	paths, err := pathsForRead(opts.DirPath)
 	if err != nil {
 		return nil, err
 	}
 
-	first := checkpoint
-	rest := segments
+	first := paths.checkpoint
+	rest := paths.segments
 	onCheckpoint := true
 	if first == "" {
-		first = segments[0]
-		rest = segments[1:]
+		first = paths.segments[0]
+		rest = paths.segments[1:]
 		onCheckpoint = false
 	}
 

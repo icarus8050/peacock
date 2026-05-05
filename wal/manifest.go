@@ -102,21 +102,30 @@ func loadOrInitManifest(dir string) (*manifest, error) {
 // 중단한다 — 디렉터리 스캔으로 우회하면 데이터 손실을 가릴 수 있다. 매니페스트도
 // segment도 없으면 wrapped os.ErrNotExist를 반환해 호출자가 "읽을 로그 없음"을
 // 단일 조건으로 처리할 수 있게 한다.
-func pathsForRead(dir string) (checkpoint string, segments []string, err error) {
+// readPaths는 replay에 쓸 파일 경로 묶음 — 체크포인트(있으면)와 segment들. 둘은
+// 항상 같이 흐른다(체크포인트 먼저 replay → segments 순서대로). checkpoint가 빈
+// 문자열이면 체크포인트 없음.
+type readPaths struct {
+	checkpoint string
+	segments   []string
+}
+
+func pathsForRead(dir string) (readPaths, error) {
 	m, err := readManifest(dir)
 	if err != nil {
-		return "", nil, err
+		return readPaths{}, err
 	}
 	if m == nil {
 		return pathsFromDiskScan(dir)
 	}
 	if err := verifyManifestArtifacts(dir, m); err != nil {
-		return "", nil, err
+		return readPaths{}, err
 	}
+	paths := readPaths{segments: segmentsToPaths(dir, m.segments)}
 	if m.checkpointSeq > 0 {
-		checkpoint = checkpointPath(dir, m.checkpointSeq)
+		paths.checkpoint = checkpointPath(dir, m.checkpointSeq)
 	}
-	return checkpoint, segmentsToPaths(dir, m.segments), nil
+	return paths, nil
 }
 
 // pathsFromDiskScan은 매니페스트가 없을 때(첫 기동 또는 pre-manifest 데이터) 디스크의
@@ -124,18 +133,18 @@ func pathsForRead(dir string) (checkpoint string, segments []string, err error) 
 // 의미를 가지므로 매니페스트 없이 디스크에 *.checkpoint 파일이 떠 있더라도 그것은
 // commit 안 된 고아 — 무시한다. listSegments는 .log suffix만 보므로 checkpoint
 // 파일은 자연스럽게 제외된다. segment도 없으면 wrapped os.ErrNotExist.
-func pathsFromDiskScan(dir string) (string, []string, error) {
+func pathsFromDiskScan(dir string) (readPaths, error) {
 	seqs, err := listSegments(dir)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			return "", nil, fmt.Errorf("wal: open: %w", os.ErrNotExist)
+			return readPaths{}, fmt.Errorf("wal: open: %w", os.ErrNotExist)
 		}
-		return "", nil, fmt.Errorf("wal: list segments: %w", err)
+		return readPaths{}, fmt.Errorf("wal: list segments: %w", err)
 	}
 	if len(seqs) == 0 {
-		return "", nil, fmt.Errorf("wal: open: %w", os.ErrNotExist)
+		return readPaths{}, fmt.Errorf("wal: open: %w", os.ErrNotExist)
 	}
-	return "", segmentsToPaths(dir, seqs), nil
+	return readPaths{segments: segmentsToPaths(dir, seqs)}, nil
 }
 
 // segmentsToPaths는 segment seq 목록을 디스크 경로 목록으로 매핑한다.

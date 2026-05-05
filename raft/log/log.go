@@ -484,11 +484,18 @@ func (l *Log) rollLocked() error {
 	if err := l.closeActiveForRollLocked(); err != nil {
 		return err
 	}
-	file, nextSeq, err := l.openNextSegmentLocked()
+	ns, err := l.openNextSegmentLocked()
 	if err != nil {
 		return err
 	}
-	return l.commitRollLocked(file, nextSeq)
+	return l.commitRollLocked(ns)
+}
+
+// nextSegment는 막 열린 새 segment의 정체성 — 파일 핸들과 그 seq. commit 단계까지
+// 같이 흐른다.
+type nextSegment struct {
+	file *os.File
+	seq  int64
 }
 
 // closeActiveForRollLocked는 현재 활성 segment의 buffered write를 비우고 fsync 후
@@ -509,30 +516,30 @@ func (l *Log) closeActiveForRollLocked() error {
 
 // openNextSegmentLocked는 다음 seq의 segment 파일을 새로 만들어 연다.
 // 아직 매니페스트에 등록되지 않은 고아 상태 — commit은 commitRollLocked가 수행.
-func (l *Log) openNextSegmentLocked() (*os.File, int64, error) {
+func (l *Log) openNextSegmentLocked() (nextSegment, error) {
 	nextSeq := l.activeSeqLocked() + 1
 	file, err := os.OpenFile(segmentPath(l.dir, nextSeq), os.O_CREATE|os.O_RDWR|os.O_APPEND, 0644)
 	if err != nil {
 		l.closed = true
-		return nil, 0, fmt.Errorf("raftlog: open next segment: %w", err)
+		return nextSegment{}, fmt.Errorf("raftlog: open next segment: %w", err)
 	}
-	return file, nextSeq, nil
+	return nextSegment{file: file, seq: nextSeq}, nil
 }
 
 // commitRollLocked는 새 segment를 매니페스트에 먼저 기록한 뒤 인메모리 state를
 // 갱신한다 — persist 실패 시 state는 손대지 않으므로 rollback 불필요. 매니페스트
 // 갱신 실패는 복구 불가이므로 새 segment 파일을 정리하고 WAL을 closed로 전환.
-func (l *Log) commitRollLocked(file *os.File, nextSeq int64) error {
-	nextSegments := append(l.segments, &segState{seq: nextSeq})
+func (l *Log) commitRollLocked(ns nextSegment) error {
+	nextSegments := append(l.segments, &segState{seq: ns.seq})
 	if err := l.persistManifestLocked(nextSegments); err != nil {
-		file.Close()
-		os.Remove(segmentPath(l.dir, nextSeq))
+		ns.file.Close()
+		os.Remove(segmentPath(l.dir, ns.seq))
 		l.closed = true
 		return fmt.Errorf("raftlog: update manifest on roll: %w", err)
 	}
 	l.segments = nextSegments
-	l.activeFile = file
-	l.activeWriter = bufio.NewWriterSize(file, l.opts.BufferSize)
+	l.activeFile = ns.file
+	l.activeWriter = bufio.NewWriterSize(ns.file, l.opts.BufferSize)
 	return nil
 }
 
