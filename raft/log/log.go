@@ -739,46 +739,55 @@ func readSegmentEntries(target scanTarget) (*segState, bool, error) {
 	}
 	defer f.Close()
 
-	br := bufio.NewReader(f)
+	scanner := &segmentScanner{br: bufio.NewReader(f), target: target}
 	ss := &segState{seq: target.seq}
-	var off int64
 
 	for {
-		entry, encoded, result, err := readNextEntry(br, target, off)
+		at := scanner.off
+		entry, result, err := scanner.readNext()
 		if err != nil {
 			return nil, false, err
 		}
 		if result == readEOF {
-			ss.size = off
+			ss.size = scanner.off
 			return ss, false, nil
 		}
 		if result == readTornTail {
-			ss.size = off
+			ss.size = scanner.off
 			return ss, true, nil
 		}
-		ss.entries = append(ss.entries, entryLoc{offset: off, term: entry.Term})
+		ss.entries = append(ss.entries, entryLoc{offset: at, term: entry.Term})
 		if ss.firstIndex == 0 {
 			ss.firstIndex = entry.Index
 		}
 		ss.lastIndex = entry.Index
-		off += int64(encoded)
 	}
 }
 
-// readNextEntry는 br에서 다음 entry 하나를 읽어 분류한다.
-//   - readOK: entry/encoded가 유효, 호출자가 누적
+// segmentScanner는 한 segment 파일을 처음부터 entry 단위로 읽어가는 iterator.
+// off는 다음 readNext가 읽을 byte offset이며, 정상 read 후 자동으로 advance된다.
+// 호출자가 여러 파라미터를 매 호출마다 반복 전달할 필요가 없도록 (br, target, off)을
+// 한 곳에 묶는다.
+type segmentScanner struct {
+	br     *bufio.Reader
+	target scanTarget
+	off    int64
+}
+
+// readNext는 다음 entry 하나를 읽어 분류한다.
+//   - readOK: entry가 유효, off가 다음 entry 시작점으로 advance됨
 //   - readEOF: 정상 EOF (활성 segment의 끝 — 마지막 쓰기까지 모두 깨끗)
 //   - readTornTail: 활성 segment 끝의 partial 쓰기 (header/body 절단 또는 CRC 오류)
 //
 // 봉인 segment에서 동일한 손상이 보이면 fatal 에러로 반환한다.
-func readNextEntry(br *bufio.Reader, target scanTarget, off int64) (Entry, int, readResult, error) {
+func (s *segmentScanner) readNext() (Entry, readResult, error) {
 	var lenBuf [lenSize]byte
-	_, err := io.ReadFull(br, lenBuf[:])
+	_, err := io.ReadFull(s.br, lenBuf[:])
 	if errors.Is(err, io.EOF) {
 		return noEntry(readEOF, nil)
 	}
 	if errors.Is(err, io.ErrUnexpectedEOF) {
-		return noEntry(tailOrSealed(target, off, "truncated header", nil))
+		return noEntry(classifyTailFault(s.target, tailFault{kind: "truncated header", off: s.off}))
 	}
 	if err != nil {
 		return noEntry(0, fmt.Errorf("raftlog: read length: %w", err))
@@ -786,38 +795,48 @@ func readNextEntry(br *bufio.Reader, target scanTarget, off int64) (Entry, int, 
 	totalLen := binary.LittleEndian.Uint32(lenBuf[:])
 
 	body := make([]byte, totalLen)
-	if _, err := io.ReadFull(br, body); err != nil {
-		return noEntry(tailOrSealed(target, off, "truncated body", nil))
+	if _, err := io.ReadFull(s.br, body); err != nil {
+		return noEntry(classifyTailFault(s.target, tailFault{kind: "truncated body", off: s.off}))
 	}
 
 	entry, err := decodeBody(body)
 	if errors.Is(err, ErrChecksumMismatch) || errors.Is(err, ErrIncompleteEntry) {
-		return noEntry(tailOrSealed(target, off, "corrupt entry", err))
+		return noEntry(classifyTailFault(s.target, tailFault{kind: "corrupt entry", off: s.off, src: err}))
 	}
 	if err != nil {
 		return noEntry(0, err)
 	}
-	return entry, lenSize + int(totalLen), readOK, nil
+	s.off += int64(lenSize + int(totalLen))
+	return entry, readOK, nil
 }
 
-// noEntry는 readNextEntry의 실패/종료 분기에서 entry/encoded 자리에 zero를 채워
-// (Entry, int, readResult, error) 4-tuple을 만드는 어댑터. 호출부에서 매번
-// `Entry{}, 0`을 반복하지 않도록 한 곳에 모은다.
-func noEntry(r readResult, err error) (Entry, int, readResult, error) {
-	return Entry{}, 0, r, err
+// noEntry는 readNext의 실패/종료 분기에서 entry 자리에 zero를 채워 3-tuple을
+// 만드는 어댑터. classifyTailFault의 (readResult, error)을 그대로 chain할 수 있다.
+func noEntry(r readResult, err error) (Entry, readResult, error) {
+	return Entry{}, r, err
 }
 
-// tailOrSealed는 tail-style 손상에 대한 정책 분기를 한 곳으로 모은다 — 활성이면
-// readTornTail로 정상 종료, 봉인이면 fatal 에러. 결과 값(readResult)은 err == nil
-// 일 때만 의미 있다. "torn"은 storage 표준 용어로 partial/incomplete write를 가리킨다.
-func tailOrSealed(target scanTarget, off int64, msg string, src error) (readResult, error) {
+// tailFault는 segment 끝에서 entry 한 개를 읽다 만난 fault의 속성을 묶는다 —
+// 어떤 종류(kind), 어디(off), 원인(src, optional). classifyTailFault가 이 fault를
+// scan 컨텍스트에 비추어 outcome으로 분류한다.
+type tailFault struct {
+	kind string // "truncated header", "truncated body", "corrupt entry"
+	off  int64  // fault 발생 시점의 파일 오프셋
+	src  error  // 원인 에러 (decode 실패 등; nil 가능)
+}
+
+// classifyTailFault는 tail-style fault를 scan 컨텍스트에 비추어 outcome으로 분류한다.
+// 활성 segment에서는 정상 종료 신호(readTornTail)이고, 봉인 segment에서는 매니페스트
+// 또는 디스크 손상이므로 fatal 에러. "torn"은 storage 표준 용어로 partial/incomplete
+// write를 가리킨다. 반환된 readResult는 err == nil일 때만 의미 있다.
+func classifyTailFault(target scanTarget, fault tailFault) (readResult, error) {
 	if target.isActive {
 		return readTornTail, nil
 	}
-	if src == nil {
-		return 0, fmt.Errorf("raftlog: sealed segment seq=%d %s at %d", target.seq, msg, off)
+	if fault.src == nil {
+		return 0, fmt.Errorf("raftlog: sealed segment seq=%d %s at %d", target.seq, fault.kind, fault.off)
 	}
-	return 0, fmt.Errorf("raftlog: sealed segment seq=%d %s at %d: %w", target.seq, msg, off, src)
+	return 0, fmt.Errorf("raftlog: sealed segment seq=%d %s at %d: %w", target.seq, fault.kind, fault.off, fault.src)
 }
 
 // truncateTailTo는 활성 segment의 디스크 파일을 size 바이트로 절단해 다음 Append가
