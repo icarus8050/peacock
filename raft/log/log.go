@@ -79,7 +79,7 @@ func Open(opts Options) (*Log, error) {
 		return nil, err
 	}
 	if stale {
-		if err := l.persistManifestLocked(); err != nil {
+		if err := l.persistManifestLocked(l.segments); err != nil {
 			l.activeFile.Close()
 			return nil, err
 		}
@@ -280,16 +280,7 @@ func (l *Log) TruncateAfter(index uint64) error {
 
 	// 자를 지점: index+1을 포함하는 segment를 찾는다. index가 0이면 전체 truncate.
 	cutIdx := index + 1
-	cutSegIdx := -1
-	for i, s := range l.segments {
-		if s.firstIndex == 0 {
-			continue // 빈 활성 segment
-		}
-		if cutIdx >= s.firstIndex && cutIdx <= s.lastIndex {
-			cutSegIdx = i
-			break
-		}
-	}
+	cutSegIdx, _, _ := l.findSegmentLocked(cutIdx)
 
 	switch {
 	case cutSegIdx == -1 && index == 0:
@@ -315,7 +306,7 @@ func (l *Log) TruncateAfter(index uint64) error {
 		}
 	}
 
-	return l.persistManifestLocked()
+	return l.persistManifestLocked(l.segments)
 }
 
 // TruncateBefore는 [firstIndex, index) 범위 entry를 제거한다. M2(snapshot)에서
@@ -490,6 +481,19 @@ func (l *Log) appendOneLocked(e *Entry) error {
 }
 
 func (l *Log) rollLocked() error {
+	if err := l.closeActiveForRollLocked(); err != nil {
+		return err
+	}
+	file, nextSeq, err := l.openNextSegmentLocked()
+	if err != nil {
+		return err
+	}
+	return l.commitRollLocked(file, nextSeq)
+}
+
+// closeActiveForRollLocked는 현재 활성 segment의 buffered write를 비우고 fsync 후
+// 닫는다. close 실패는 복구 불가 — WAL을 closed로 전환한다.
+func (l *Log) closeActiveForRollLocked() error {
 	if err := l.activeWriter.Flush(); err != nil {
 		return fmt.Errorf("raftlog: flush on roll: %w", err)
 	}
@@ -500,28 +504,35 @@ func (l *Log) rollLocked() error {
 		l.closed = true
 		return fmt.Errorf("raftlog: close on roll: %w", err)
 	}
+	return nil
+}
 
+// openNextSegmentLocked는 다음 seq의 segment 파일을 새로 만들어 연다.
+// 아직 매니페스트에 등록되지 않은 고아 상태 — commit은 commitRollLocked가 수행.
+func (l *Log) openNextSegmentLocked() (*os.File, int64, error) {
 	nextSeq := l.activeSeqLocked() + 1
 	file, err := os.OpenFile(segmentPath(l.dir, nextSeq), os.O_CREATE|os.O_RDWR|os.O_APPEND, 0644)
 	if err != nil {
 		l.closed = true
-		return fmt.Errorf("raftlog: open next segment: %w", err)
+		return nil, 0, fmt.Errorf("raftlog: open next segment: %w", err)
 	}
+	return file, nextSeq, nil
+}
 
-	newSeg := &segState{seq: nextSeq}
-	prevSegments := l.segments
-	l.segments = append(l.segments, newSeg)
-	l.activeFile = file
-	l.activeWriter = bufio.NewWriterSize(file, l.opts.BufferSize)
-
-	if err := l.persistManifestLocked(); err != nil {
-		// 매니페스트 갱신 실패 — 새 segment 파일은 매니페스트 밖 고아이므로 정리.
-		l.segments = prevSegments
+// commitRollLocked는 새 segment를 매니페스트에 먼저 기록한 뒤 인메모리 state를
+// 갱신한다 — persist 실패 시 state는 손대지 않으므로 rollback 불필요. 매니페스트
+// 갱신 실패는 복구 불가이므로 새 segment 파일을 정리하고 WAL을 closed로 전환.
+func (l *Log) commitRollLocked(file *os.File, nextSeq int64) error {
+	nextSegments := append(l.segments, &segState{seq: nextSeq})
+	if err := l.persistManifestLocked(nextSegments); err != nil {
 		file.Close()
 		os.Remove(segmentPath(l.dir, nextSeq))
 		l.closed = true
 		return fmt.Errorf("raftlog: update manifest on roll: %w", err)
 	}
+	l.segments = nextSegments
+	l.activeFile = file
+	l.activeWriter = bufio.NewWriterSize(file, l.opts.BufferSize)
 	return nil
 }
 
@@ -635,13 +646,16 @@ func (l *Log) resetActiveLocked() error {
 	return nil
 }
 
-// persistManifestLocked는 현 segments 상태를 매니페스트로 영속화한다.
-func (l *Log) persistManifestLocked() error {
+// persistManifestLocked는 segments에서 매니페스트를 빌드해 영속화하고 성공 시
+// l.manifest를 갱신한다. segments를 인자로 받아 호출자가 state 갱신 전에
+// persist를 시도할 수 있게 한다 — 실패 시 l.segments는 손대지 않으므로 rollback이
+// 필요 없다.
+func (l *Log) persistManifestLocked(segments []*segState) error {
 	next := &manifest{
 		generation: l.manifest.generation + 1,
-		segments:   make([]segmentMeta, len(l.segments)),
+		segments:   make([]segmentMeta, len(segments)),
 	}
-	for i, s := range l.segments {
+	for i, s := range segments {
 		next.segments[i] = segmentMeta{
 			seq:        s.seq,
 			firstIndex: s.firstIndex,

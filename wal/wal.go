@@ -84,6 +84,19 @@ func (w *WAL) Append(entry *Entry) error {
 // 시 WAL은 복구 불가능한 상태가 되므로 closed로 전환한다. 호출자는 WAL을 닫고
 // 재오픈해야 한다.
 func (w *WAL) rollLocked() error {
+	if err := w.closeActiveForRollLocked(); err != nil {
+		return err
+	}
+	file, nextSeq, err := w.openNextSegmentLocked()
+	if err != nil {
+		return err
+	}
+	return w.commitRollLocked(file, nextSeq)
+}
+
+// closeActiveForRollLocked는 현재 활성 segment의 buffered write를 비우고 fsync 후
+// 닫는다. close 실패는 복구 불가 — WAL을 closed로 전환한다.
+func (w *WAL) closeActiveForRollLocked() error {
 	if err := w.writer.Flush(); err != nil {
 		return fmt.Errorf("wal: flush on roll: %w", err)
 	}
@@ -94,26 +107,33 @@ func (w *WAL) rollLocked() error {
 		w.closed = true
 		return fmt.Errorf("wal: close on roll: %w", err)
 	}
+	return nil
+}
 
+// openNextSegmentLocked는 다음 seq의 segment 파일을 새로 만들어 연다.
+// 아직 매니페스트에 등록되지 않은 고아 상태 — commit은 commitRollLocked가 수행.
+func (w *WAL) openNextSegmentLocked() (*os.File, int64, error) {
 	nextSeq := w.seq + 1
 	file, err := os.OpenFile(segmentPath(w.dir, nextSeq), os.O_CREATE|os.O_RDWR|os.O_APPEND, 0644)
 	if err != nil {
 		w.closed = true
-		return fmt.Errorf("wal: open next segment: %w", err)
+		return nil, 0, fmt.Errorf("wal: open next segment: %w", err)
 	}
+	return file, nextSeq, nil
+}
 
+// commitRollLocked는 매니페스트에 먼저 기록한 뒤 인메모리 state를 갱신한다 —
+// persist 실패 시 state는 손대지 않으므로 rollback 불필요. 매니페스트 갱신 실패는
+// 복구 불가이므로 새 segment 파일을 정리하고 WAL을 closed로 전환한다 — 매니페스트
+// 분실 후 listSegments 마이그레이션이 고아를 정상 segment로 흡수하는 위험을 없앤다.
+func (w *WAL) commitRollLocked(file *os.File, nextSeq int64) error {
 	nextManifest := postRollManifest(w.manifest, nextSeq)
 	if err := writeManifest(w.dir, nextManifest); err != nil {
 		file.Close()
-		// 매니페스트 갱신 실패 — 새 세그먼트 파일은 어떤 매니페스트에도 기록되지
-		// 않은 고아다. OpenReader는 매니페스트를 신뢰해 무시하지만, 매니페스트가
-		// 분실되어 다음 Open이 listSegments 마이그레이션 경로를 타면 이 고아가
-		// 정상 세그먼트로 흡수된다. 즉시 정리해 그 위험을 없앤다.
 		os.Remove(segmentPath(w.dir, nextSeq))
 		w.closed = true
 		return fmt.Errorf("wal: update manifest on roll: %w", err)
 	}
-
 	w.seq = nextSeq
 	w.size = 0
 	w.file = file
