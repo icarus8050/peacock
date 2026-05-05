@@ -58,6 +58,10 @@ func (r *Reader) ReadEntry() (Entry, error) {
 	}
 }
 
+func (r *Reader) Close() error {
+	return r.file.Close()
+}
+
 func (r *Reader) advance() error {
 	if err := r.file.Close(); err != nil {
 		return fmt.Errorf("wal: close segment: %w", err)
@@ -100,8 +104,4 @@ func (r *Reader) readCurrent() (Entry, error) {
 	}
 
 	return decodeBody(body)
-}
-
-func (r *Reader) Close() error {
-	return r.file.Close()
 }

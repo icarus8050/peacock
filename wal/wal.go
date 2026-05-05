@@ -78,6 +78,50 @@ func (w *WAL) Append(entry *Entry) error {
 	return err
 }
 
+func (w *WAL) Sync() error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	if w.closed {
+		return ErrClosed
+	}
+	if err := w.writer.Flush(); err != nil {
+		return fmt.Errorf("wal: flush: %w", err)
+	}
+	if err := w.file.Sync(); err != nil {
+		return fmt.Errorf("wal: fsync: %w", err)
+	}
+	return nil
+}
+
+// Close는 백그라운드 goroutine이 Sync를 호출 중이라면 호출 전에 그 goroutine을
+// 정지시켜야 한다.
+func (w *WAL) Close() error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	if w.closed {
+		return ErrClosed
+	}
+	w.closed = true
+
+	if err := w.writer.Flush(); err != nil {
+		w.file.Close()
+		return fmt.Errorf("wal: flush on close: %w", err)
+	}
+	if err := w.file.Sync(); err != nil {
+		w.file.Close()
+		return fmt.Errorf("wal: fsync on close: %w", err)
+	}
+	return w.file.Close()
+}
+
+func (w *WAL) path() string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.file.Name()
+}
+
 // rollLocked는 현재 segment를 닫고 다음 segment를 연다. WAL이 새 segment로
 // 전환되기 전에 매니페스트에 먼저 기록하므로, roll과 다음 Append 사이에 크래시가
 // 나도 매니페스트가 권위 있는 segment 목록 역할을 한다. close/open/manifest 실패
@@ -154,48 +198,4 @@ func postRollManifest(prev *manifest, newSeq int64) *manifest {
 		checkpointSeq: prev.checkpointSeq,
 		segments:      segments,
 	}
-}
-
-func (w *WAL) Sync() error {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-
-	if w.closed {
-		return ErrClosed
-	}
-	if err := w.writer.Flush(); err != nil {
-		return fmt.Errorf("wal: flush: %w", err)
-	}
-	if err := w.file.Sync(); err != nil {
-		return fmt.Errorf("wal: fsync: %w", err)
-	}
-	return nil
-}
-
-// Close는 백그라운드 goroutine이 Sync를 호출 중이라면 호출 전에 그 goroutine을
-// 정지시켜야 한다.
-func (w *WAL) Close() error {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-
-	if w.closed {
-		return ErrClosed
-	}
-	w.closed = true
-
-	if err := w.writer.Flush(); err != nil {
-		w.file.Close()
-		return fmt.Errorf("wal: flush on close: %w", err)
-	}
-	if err := w.file.Sync(); err != nil {
-		w.file.Close()
-		return fmt.Errorf("wal: fsync on close: %w", err)
-	}
-	return w.file.Close()
-}
-
-func (w *WAL) path() string {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	return w.file.Name()
 }
