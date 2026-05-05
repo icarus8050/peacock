@@ -61,21 +61,6 @@ func (r *Reader) Close() error {
 	return r.file.Close()
 }
 
-func (r *Reader) advance() error {
-	if err := r.file.Close(); err != nil {
-		return fmt.Errorf("wal: close segment: %w", err)
-	}
-	next := r.paths[0]
-	r.paths = r.paths[1:]
-	file, err := os.Open(next)
-	if err != nil {
-		return fmt.Errorf("wal: open segment: %w", err)
-	}
-	r.file = file
-	r.onCheckpoint = false
-	return nil
-}
-
 func (r *Reader) readCurrent() (Entry, error) {
 	var lenBuf [lenSize]byte
 	_, err := io.ReadFull(r.file, lenBuf[:])
@@ -103,4 +88,19 @@ func (r *Reader) readCurrent() (Entry, error) {
 	}
 
 	return decodeBody(body)
+}
+
+func (r *Reader) advance() error {
+	if err := r.file.Close(); err != nil {
+		return fmt.Errorf("wal: close segment: %w", err)
+	}
+	next := r.paths[0]
+	r.paths = r.paths[1:]
+	file, err := os.Open(next)
+	if err != nil {
+		return fmt.Errorf("wal: open segment: %w", err)
+	}
+	r.file = file
+	r.onCheckpoint = false
+	return nil
 }

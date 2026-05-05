@@ -205,26 +205,6 @@ func (w *WAL) Compact(trigger int, keyOf func(*Entry) ([]byte, error)) (bool, er
 	return true, nil
 }
 
-// buildCompactedEntries는 plan의 옛 체크포인트와 봉인 segment를 keyOf 기준으로
-// dedupe해 새 체크포인트에 쓸 entry 목록을 만든다. OpDelete로 끝난 키는 결과에서
-// 제외된다. 락 밖에서 호출되며 디스크만 읽는다.
-func buildCompactedEntries(plan compactionPlan, keyOf func(*Entry) ([]byte, error)) ([]*Entry, error) {
-	state := make(map[string]Entry)
-	if err := applyCheckpointFile(state, plan.checkpointFile, keyOf); err != nil {
-		return nil, err
-	}
-	for _, path := range plan.sealedFiles {
-		if err := applySealedSegment(state, path, keyOf); err != nil {
-			return nil, err
-		}
-	}
-	entries := make([]*Entry, 0, len(state))
-	for _, e := range state {
-		entries = append(entries, &e)
-	}
-	return entries, nil
-}
-
 // beginCompaction은 락 안에서 매니페스트 스냅샷을 떠 압축 계획을 만든다.
 // trigger 미달, 이미 진행 중인 압축이 있거나 closed면 (zero, false).
 func (w *WAL) beginCompaction(trigger int) (compactionPlan, bool) {
@@ -257,6 +237,26 @@ func (w *WAL) endCompaction() {
 	w.mu.Lock()
 	w.compacting = false
 	w.mu.Unlock()
+}
+
+// buildCompactedEntries는 plan의 옛 체크포인트와 봉인 segment를 keyOf 기준으로
+// dedupe해 새 체크포인트에 쓸 entry 목록을 만든다. OpDelete로 끝난 키는 결과에서
+// 제외된다. 락 밖에서 호출되며 디스크만 읽는다.
+func buildCompactedEntries(plan compactionPlan, keyOf func(*Entry) ([]byte, error)) ([]*Entry, error) {
+	state := make(map[string]Entry)
+	if err := applyCheckpointFile(state, plan.checkpointFile, keyOf); err != nil {
+		return nil, err
+	}
+	for _, path := range plan.sealedFiles {
+		if err := applySealedSegment(state, path, keyOf); err != nil {
+			return nil, err
+		}
+	}
+	entries := make([]*Entry, 0, len(state))
+	for _, e := range state {
+		entries = append(entries, &e)
+	}
+	return entries, nil
 }
 
 // applyCheckpointFile은 옛 체크포인트의 entries를 state에 적용한다. 체크포인트는
