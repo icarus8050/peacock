@@ -178,6 +178,54 @@ func requireSegmentExists(dir string, seq int64) error {
 - 헬퍼 신설 비용 vs jump-to-definition 부담: 헬퍼 이름이 self-explaining이면 호출부에서 점프 안 해도 흐름 이해됨 → 분리 권장.
 - "한 곳에서 다 보고 싶다"는 동기는 함수가 짧을 때만 유효. 30행 이상이면 분리 이득이 거의 항상 큼.
 
+## 함수 시그니처 — 반환값 응집
+
+여러 값을 반환할 때 flat tuple로 늘어놓지 말고 **의미가 담긴 도메인 타입**으로 응집한다. 호출부는 "함수가 무엇을 반환했는가"를 타입 이름 한 곳에서 읽어야 한다.
+
+### 신호 — struct로 묶을 후보
+
+- 두 개 이상의 반환값이 **개념적으로 한 묶음** (같은 작업의 결과, 같은 컨텍스트의 속성).
+- 호출부가 항상 두 값을 **같이 사용**하거나 **같이 무시**하는 형태.
+- 시그니처가 `(*X, bool, error)`, `(int, int64, T, error)` 같은 4-튜플 이상으로 길어짐.
+- 같은 함수의 여러 분기에서 반환할 때 `Entry{}, 0, ...` 같은 zero 패딩이 반복됨.
+
+### 분리 기준 — error는 항상 별도
+
+`(domainResult, error)` 형태가 Go 관용구. error는 도메인 객체에 섞지 않는다 (Go의 errors.Is/As 흐름과 충돌).
+
+### 예시
+
+```go
+// Before: 의미 없는 3-tuple — 두 값의 관계가 시그니처에 안 보임
+func scanSegment(target scanTarget) (*segState, bool, error)
+
+ss, truncated, err := scanSegment(target)
+
+// After: scanResult가 "한 segment 스캔의 결과"라는 도메인 개념을 박음
+type scanResult struct {
+    state     *segState
+    truncated bool
+}
+
+func scanSegment(target scanTarget) (scanResult, error)
+
+result, err := scanSegment(target)
+// result.state, result.truncated — 의도가 자명
+```
+
+### 이름 규약
+
+- Go 컨벤션의 `xxxResult` 접미사를 선호 (예: `scanResult`, `scanOutcome`보단 `scanResult`).
+- 같은 도메인의 여러 레벨이 있으면 prefix로 추상도를 구분:
+  - 한 entry read → `readResult` (entry 단위)
+  - 한 segment scan → `scanResult` (segment 단위)
+
+### 트레이드오프
+
+- 두 값이 정말로 무관하면 분리 유지 (예: `io.Reader.Read(buf) (n int, err error)`의 `n`/`err` 같은 표준 관용구는 그대로).
+- 1번만 호출되는 사적 helper의 2-tuple 반환은 묶지 않아도 무방.
+- 도메인 타입을 만들 때 **하나의 응집된 의미**가 있어야 한다. 임의 묶음은 오히려 가독성을 해친다 — "왜 이 두 값이 같이 있는가?"가 타입 doc 한 줄로 답해져야.
+
 ## Zero Value
 
 - Go의 zero value가 유효한 초기 상태이면, 명시적 초기화를 생략한다 (예: `sync.Mutex`, `bytes.Buffer`).
