@@ -43,10 +43,9 @@ func (r *Reader) ReadEntry() (Entry, error) {
 		entry, err := r.readCurrent()
 		// 체크포인트는 atomic write로 항상 완전해야 한다 — tail-style 에러는
 		// 디스크 손상을 의미하므로 segment의 정상 tail truncation과 구별해 보고한다.
-		if err != nil && r.onCheckpoint {
-			if errors.Is(err, ErrIncompleteEntry) || errors.Is(err, ErrChecksumMismatch) {
-				return Entry{}, fmt.Errorf("%w: %v", ErrCheckpointCorrupt, err)
-			}
+		// errors.Is(nil, X)는 false라 outer err != nil 가드는 불필요.
+		if r.onCheckpoint && (errors.Is(err, ErrIncompleteEntry) || errors.Is(err, ErrChecksumMismatch)) {
+			return Entry{}, fmt.Errorf("%w: %v", ErrCheckpointCorrupt, err)
 		}
 		if errors.Is(err, io.EOF) && len(r.paths) > 0 {
 			if err := r.advance(); err != nil {

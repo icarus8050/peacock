@@ -265,44 +265,66 @@ func applyCheckpointFile(state map[string]Entry, path string, keyOf func(*Entry)
 	if path == "" {
 		return nil
 	}
-	return applyFile(state, path, true, keyOf)
-}
-
-// applySealedSegment는 봉인 segment의 entries를 state에 적용한다. tail truncation
-// (ErrIncompleteEntry/ErrChecksumMismatch)은 정상 로그 끝으로 간주 — kv replay와
-// 동일 정책.
-func applySealedSegment(state map[string]Entry, path string, keyOf func(*Entry) ([]byte, error)) error {
-	return applyFile(state, path, false, keyOf)
-}
-
-func applyFile(state map[string]Entry, path string, isCheckpoint bool, keyOf func(*Entry) ([]byte, error)) error {
 	file, err := os.Open(path)
 	if err != nil {
 		return fmt.Errorf("wal: compact open: %w", err)
 	}
 	defer file.Close()
 
-	r := &Reader{file: file, onCheckpoint: isCheckpoint}
+	r := &Reader{file: file, onCheckpoint: true}
 	for {
 		entry, err := r.ReadEntry()
 		if errors.Is(err, io.EOF) {
 			return nil
 		}
-		if !isCheckpoint && (errors.Is(err, ErrIncompleteEntry) || errors.Is(err, ErrChecksumMismatch)) {
+		if err != nil {
+			return err
+		}
+		if err := applyEntry(state, &entry, keyOf); err != nil {
+			return err
+		}
+	}
+}
+
+// applySealedSegment는 봉인 segment의 entries를 state에 적용한다. tail truncation
+// (ErrIncompleteEntry/ErrChecksumMismatch)은 정상 로그 끝으로 간주 — kv replay와
+// 동일 정책.
+func applySealedSegment(state map[string]Entry, path string, keyOf func(*Entry) ([]byte, error)) error {
+	file, err := os.Open(path)
+	if err != nil {
+		return fmt.Errorf("wal: compact open: %w", err)
+	}
+	defer file.Close()
+
+	r := &Reader{file: file, onCheckpoint: false}
+	for {
+		entry, err := r.ReadEntry()
+		if errors.Is(err, io.EOF) ||
+			errors.Is(err, ErrIncompleteEntry) ||
+			errors.Is(err, ErrChecksumMismatch) {
 			return nil
 		}
 		if err != nil {
 			return err
 		}
-		key, err := keyOf(&entry)
-		if err != nil {
-			return fmt.Errorf("wal: compact keyOf: %w", err)
-		}
-		switch entry.Op {
-		case OpPut:
-			state[string(key)] = entry
-		case OpDelete:
-			delete(state, string(key))
+		if err := applyEntry(state, &entry, keyOf); err != nil {
+			return err
 		}
 	}
+}
+
+// applyEntry는 한 entry를 state에 적용한다. keyOf로 키를 추출한 뒤 Op에 따라 Put
+// (덮어쓰기) 또는 Delete (제거).
+func applyEntry(state map[string]Entry, e *Entry, keyOf func(*Entry) ([]byte, error)) error {
+	key, err := keyOf(e)
+	if err != nil {
+		return fmt.Errorf("wal: compact keyOf: %w", err)
+	}
+	switch e.Op {
+	case OpPut:
+		state[string(key)] = *e
+	case OpDelete:
+		delete(state, string(key))
+	}
+	return nil
 }
