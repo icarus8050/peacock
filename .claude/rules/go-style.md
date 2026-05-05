@@ -53,7 +53,21 @@
 - 기본값은 `applyDefaults()` 같은 정규화 함수 한 곳에서 관리하거나, `DefaultOptions` 팩토리로 제공한다. 같은 기본값을 여러 곳에 중복해 박지 않는다.
 ## 추상화 수준 일치
 
-한 함수 안에서 추상화 레벨을 통일한다. 호출부는 "흐름 한 줄에 한 단계"로 읽혀야 한다.
+**하나의 함수는 하나의 추상화 수준이어야 한다. 한 함수 안에 높은 수준의 개념과 낮은 수준의 세부 구현이 공존해서는 안 된다.**
+
+**함수는 위에서 아래로 이야기처럼 읽혀야 하며, 각 함수는 자신보다 한 단계 낮은 추상화 수준의 함수를 호출해야 한다.**
+
+호출부는 "흐름 한 줄에 한 단계"로 읽힌다 — 단계 이름의 나열. 그 단계의 구현 디테일(루프, 바이트 조립, 분류 분기)은 한 단계 아래의 헬퍼 안에 가둔다.
+
+### 추상화 수준의 구분
+
+일반적으로 **고수준 / 중간 / 저수준** 셋으로 본다.
+
+- **고수준 (High Level)** — 핵심 비즈니스 로직, **무엇(What)**을 하는지 기술. 예: `createOrder()`, `(*WAL).CommitCompaction()`.
+- **중간 (Medium Level)** — 고수준 흐름을 구성하는 단계 이름. 예: `validateCompactionArgs(...)`, `writeManifest(...)`, `cleanupCompactedFiles(...)`.
+- **저수준 (Low Level)** — 구체적인 구현 세부, **어떻게(How)**를 기술. 예: `db.execute("INSERT...")`, `binary.LittleEndian.PutUint64(...)`, `os.Remove(segmentPath(dir, s))`.
+
+한 함수가 자신보다 두 단계 이상 낮은 호출을 직접 들고 있으면 추상화 수준이 섞인 것이다. 예: 고수준 함수 `CommitCompaction`이 직접 `os.Remove`(저수준)를 호출하면 안 되고, 중간 단계 `cleanupCompactedFiles`를 거쳐야 한다.
 
 ### 신호 — 분리 검토 대상
 
@@ -61,6 +75,7 @@
 - 한 함수 안에서 **루프와 흐름이 번갈아** 등장한다 (e.g., `for ... { ... }` 다음 `if ... { ... }` 다음 `for ... { ... }`).
 - 30~40행을 넘어가며 단계 사이 빈 줄로 구분된 블록이 여럿 있다.
 - 인라인 주석으로 단계 경계를 표시해야 읽힌다 (`// 1단계 ...`, `// 다음 ...`).
+- **들여쓰기가 3단계 이상**이고 각 단계가 서로 다른 의미 결정을 내린다 (e.g., `for` → `if err != nil` → `if errors.Is(...)` → 분기). 들여쓰기 깊이 자체가 추상화 수준이 섞여 있다는 신호.
 
 ### 분리 방법
 
@@ -107,6 +122,56 @@ func (w *WAL) CommitCompaction(...) error {
 - **저수준 세부의 헬퍼화**: 옵션 변환, 바이트 조립, 플래그 분기 등을 `walOptionsFrom`처럼 추출. `kv.Open`이 옵션 세부를 `walOptionsFrom`으로 감춰 "정규화 → 재생 → 오픈 → 시작" 흐름만 남기는 사례.
 - **상태 접근 메서드화**: `w.manifest.segments[len(...)-1]` 같은 패턴이 두 곳 이상 등장하면 `m.activeSeq()` 같은 메서드로. 의도가 이름에 박혀 호출부가 짧아진다.
 - **헬퍼 위치**: 호출부 바로 아래 또는 같은 파일 말미. 주제별 파일이 따로 있으면(`compact.go` 등) 토픽 친화적 위치 우선.
+
+### 들여쓰기 평탄화
+
+위 "신호"에서 들여쓰기 3단계 이상이 보이면 다음 세 패턴을 순서대로 적용한다.
+
+1. **루프 본체 헬퍼화** — 루프 안에서 element별로 검증/분류/에러 분기를 하면 본체를 `requireX(args) error` 같은 헬퍼로 추출한다. 호출부 루프는 "각 원소에 X를 적용 → 첫 실패면 중단"이라는 한 줄 의도만 남는다.
+
+2. **early-return 평탄화** — `if err != nil { if errors.Is(A) {...}; if errors.Is(B) {...}; ... }` 형태의 inverted 분기는 `if err == nil { return nil }`로 success-fast하고 이후 분류 분기를 직선 나열로 쓴다. 들여쓰기 한 단계가 사라진다.
+
+3. **도메인 특수 케이스는 호출부로** — 검증/변환 함수 안에 `if item.special { continue }` 같은 예외 처리가 들어가면 함수가 두 가지 일(일반 처리 + 예외 처리)을 한다. 호출부에서 미리 partition(`sealed := items[:len(items)-1]` 같은 슬라이싱 또는 별도 메서드)해 함수는 "전체에 일관 적용"이라는 단일 의미만 갖게 한다.
+
+```go
+// Before: 3단계 들여쓰기 + 특수 케이스 + 두 단계 errors.Is
+func verifyManifestArtifacts(dir string, m *manifest) error {
+    if len(m.segments) == 0 { return ... }
+    for _, s := range m.segments {
+        if _, err := os.Stat(segmentPath(dir, s.seq)); err != nil {
+            if errors.Is(err, os.ErrNotExist) {
+                if s.seq == m.active().seq { continue } // 도메인 룰
+                return fmt.Errorf("%w: ...", ErrMissingSegment)
+            }
+            return fmt.Errorf("...: %w", err)
+        }
+    }
+    return nil
+}
+
+// After: 호출부에 도메인 룰, 루프는 한 줄, 분류는 직선.
+func verifyManifestArtifacts(dir string, m *manifest) error {
+    if len(m.segments) == 0 { return ... }
+    sealed := m.segments[:len(m.segments)-1] // 활성은 Open이 만든다
+    return verifySegmentsExist(dir, sealed)
+}
+func verifySegmentsExist(dir string, segments []segmentMeta) error {
+    for _, s := range segments {
+        if err := requireSegmentExists(dir, s.seq); err != nil {
+            return err
+        }
+    }
+    return nil
+}
+func requireSegmentExists(dir string, seq int64) error {
+    _, err := os.Stat(segmentPath(dir, seq))
+    if err == nil { return nil }
+    if errors.Is(err, os.ErrNotExist) {
+        return fmt.Errorf("%w: seq=%d", ErrMissingSegment, seq)
+    }
+    return fmt.Errorf("...: %w", err)
+}
+```
 
 ### 트레이드오프
 

@@ -86,20 +86,34 @@ func verifyManifestArtifacts(dir string, m *manifest) error {
 	if len(m.segments) == 0 {
 		return fmt.Errorf("%w: empty segment list", ErrManifestCorrupt)
 	}
-	for _, s := range m.segments {
-		path := segmentPath(dir, s.seq)
-		if _, err := os.Stat(path); err != nil {
-			if errors.Is(err, os.ErrNotExist) {
-				// 활성 segment(마지막)는 Open이 곧 생성하므로 누락 허용.
-				if s.seq == m.active().seq {
-					continue
-				}
-				return fmt.Errorf("%w: seq=%d", ErrMissingSegment, s.seq)
-			}
-			return fmt.Errorf("raftlog: stat segment: %w", err)
+	// 활성 segment(마지막)는 Open이 곧 생성하므로 존재 검증에서 제외.
+	sealed := m.segments[:len(m.segments)-1]
+	return verifySegmentsExist(dir, sealed)
+}
+
+// verifySegmentsExist는 매니페스트가 참조하는 모든 segment 파일이 디스크에 존재하는지
+// 확인한다. 누락 시 ErrMissingSegment(wrap)로 중단해 매니페스트와 디스크 뷰가
+// 일치하는 상태에서만 진행하도록 강제한다.
+func verifySegmentsExist(dir string, segments []segmentMeta) error {
+	for _, s := range segments {
+		if err := requireSegmentExists(dir, s.seq); err != nil {
+			return err
 		}
 	}
 	return nil
+}
+
+// requireSegmentExists는 단일 segment 파일이 존재하는지 확인하고 부재/접근 오류를
+// 도메인 에러(ErrMissingSegment 또는 wrap)로 분류한다.
+func requireSegmentExists(dir string, seq int64) error {
+	_, err := os.Stat(segmentPath(dir, seq))
+	if err == nil {
+		return nil
+	}
+	if errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("%w: seq=%d", ErrMissingSegment, seq)
+	}
+	return fmt.Errorf("raftlog: stat segment: %w", err)
 }
 
 // encode는 매니페스트를 디스크 바이너리 형식으로 직렬화한다.
