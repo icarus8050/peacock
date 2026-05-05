@@ -97,19 +97,19 @@ func (l *Log) replaySegments() (stale bool, err error) {
 			seq:      sm.seq,
 			isActive: i == len(l.manifest.segments)-1,
 		}
-		ss, truncated, err := scanSegment(target)
+		out, err := scanSegment(target)
 		if err != nil {
 			return false, err
 		}
 		if !target.isActive {
-			if err := verifySealedMeta(sm, ss); err != nil {
+			if err := verifySealedMeta(sm, out.state); err != nil {
 				return false, err
 			}
 		}
-		if truncated {
+		if out.truncated {
 			stale = true
 		}
-		l.segments = append(l.segments, ss)
+		l.segments = append(l.segments, out.state)
 	}
 	return stale, nil
 }
@@ -712,30 +712,37 @@ const (
 	readTornTail
 )
 
+// scanResult은 한 segment 스캔의 결과 — 채워진 segState와 활성 segment에서 tail
+// truncation이 발생했는지 여부. 두 값은 한 묶음으로 호출자에게 전달된다.
+type scanResult struct {
+	state     *segState
+	truncated bool
+}
+
 // scanSegment는 target.path의 segment 파일을 읽어 segState를 채운다.
 // target.isActive=true이면 tail corruption(부분 entry, CRC 오류)을 정상 종료의 signal로
 // 보고 그 지점에서 절단한다 — 절단된 size를 호출자에 알려 매니페스트 갱신을 유도.
 // false면 corruption은 fatal.
-func scanSegment(target scanTarget) (*segState, bool, error) {
-	ss, truncated, err := readSegmentEntries(target)
+func scanSegment(target scanTarget) (scanResult, error) {
+	out, err := readSegmentEntries(target)
 	if err != nil {
-		return nil, false, err
+		return scanResult{}, err
 	}
-	if truncated {
-		if err := truncateTailTo(target.path, ss.size); err != nil {
-			return nil, false, err
+	if out.truncated {
+		if err := truncateTailTo(target.path, out.state.size); err != nil {
+			return scanResult{}, err
 		}
 	}
-	return ss, truncated, nil
+	return out, nil
 }
 
 // readSegmentEntries는 segment 파일을 처음부터 읽어 인메모리 segState를 만든다.
 // 활성 segment에서 tail corruption이 감지되면 truncated=true로 알리고 그 지점까지의
 // 결과를 반환한다 — 디스크 파일 절단은 호출자(scanSegment)가 수행.
-func readSegmentEntries(target scanTarget) (*segState, bool, error) {
+func readSegmentEntries(target scanTarget) (scanResult, error) {
 	f, err := os.OpenFile(target.path, os.O_CREATE|os.O_RDONLY, 0644)
 	if err != nil {
-		return nil, false, fmt.Errorf("raftlog: open segment for scan: %w", err)
+		return scanResult{}, fmt.Errorf("raftlog: open segment for scan: %w", err)
 	}
 	defer f.Close()
 
@@ -746,15 +753,15 @@ func readSegmentEntries(target scanTarget) (*segState, bool, error) {
 		at := scanner.off
 		entry, result, err := scanner.readNext()
 		if err != nil {
-			return nil, false, err
+			return scanResult{}, err
 		}
 		if result == readEOF {
 			ss.size = scanner.off
-			return ss, false, nil
+			return scanResult{state: ss, truncated: false}, nil
 		}
 		if result == readTornTail {
 			ss.size = scanner.off
-			return ss, true, nil
+			return scanResult{state: ss, truncated: true}, nil
 		}
 		ss.entries = append(ss.entries, entryLoc{offset: at, term: entry.Term})
 		if ss.firstIndex == 0 {
