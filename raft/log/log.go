@@ -110,18 +110,6 @@ func (l *Log) replaySegments() (stale bool, err error) {
 	return stale, nil
 }
 
-// verifySealedMeta는 봉인 segment의 매니페스트 메타와 디스크 스캔 결과가 일치하는지
-// 검증한다. 어긋나면 매니페스트 손상.
-func verifySealedMeta(sm segmentMeta, ss *segState) error {
-	if ss.firstIndex == sm.firstIndex && ss.lastIndex == sm.lastIndex && ss.size == sm.size {
-		return nil
-	}
-	return fmt.Errorf("%w: sealed segment seq=%d disk=%d..%d/%dB manifest=%d..%d/%dB",
-		ErrManifestCorrupt, sm.seq,
-		ss.firstIndex, ss.lastIndex, ss.size,
-		sm.firstIndex, sm.lastIndex, sm.size)
-}
-
 // FirstIndex는 로그에 남아 있는 첫 entry의 index를 반환한다. 비어 있으면 0.
 // snapshot truncation 후에는 firstIndex > 1이 될 수 있다(M2 이후).
 func (l *Log) FirstIndex() uint64 {
@@ -676,6 +664,18 @@ func (l *Log) openActiveLocked() error {
 	l.activeFile = file
 	l.activeWriter = bufio.NewWriterSize(file, l.opts.BufferSize)
 	return nil
+}
+
+// verifySealedMeta는 봉인 segment의 매니페스트 메타와 디스크 스캔 결과가 일치하는지
+// 검증한다. 어긋나면 매니페스트 손상.
+func verifySealedMeta(sm segmentMeta, ss *segState) error {
+	if ss.firstIndex == sm.firstIndex && ss.lastIndex == sm.lastIndex && ss.size == sm.size {
+		return nil
+	}
+	return fmt.Errorf("%w: sealed segment seq=%d disk=%d..%d/%dB manifest=%d..%d/%dB",
+		ErrManifestCorrupt, sm.seq,
+		ss.firstIndex, ss.lastIndex, ss.size,
+		sm.firstIndex, sm.lastIndex, sm.size)
 }
 
 // scanSegment는 디스크에서 segment를 읽어 segState를 채운다.
