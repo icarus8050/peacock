@@ -62,50 +62,64 @@ type Log struct {
 // 절단하지만, 봉인 segment의 corruption은 fatal로 보고한다.
 func Open(opts Options) (*Log, error) {
 	opts = opts.withDefaults()
-
 	if err := os.MkdirAll(opts.DirPath, 0755); err != nil {
 		return nil, fmt.Errorf("raftlog: mkdir: %w", err)
 	}
-
 	m, err := loadOrInitManifest(opts.DirPath)
 	if err != nil {
 		return nil, err
 	}
 
 	l := &Log{dir: opts.DirPath, opts: opts, manifest: m}
-
-	manifestStale := false
-	for i, sm := range m.segments {
-		isActive := i == len(m.segments)-1
-		ss, truncated, err := scanSegment(opts.DirPath, sm, isActive)
-		if err != nil {
-			return nil, err
-		}
-		if truncated {
-			manifestStale = true
-		}
-		// 봉인 segment 메타가 디스크 스캔 결과와 다르면 매니페스트 손상이므로 중단.
-		if !isActive && (ss.firstIndex != sm.firstIndex || ss.lastIndex != sm.lastIndex || ss.size != sm.size) {
-			return nil, fmt.Errorf("%w: sealed segment seq=%d disk=%d..%d/%dB manifest=%d..%d/%dB",
-				ErrManifestCorrupt, sm.seq,
-				ss.firstIndex, ss.lastIndex, ss.size,
-				sm.firstIndex, sm.lastIndex, sm.size)
-		}
-		l.segments = append(l.segments, ss)
+	stale, err := l.replaySegments()
+	if err != nil {
+		return nil, err
 	}
-
 	if err := l.openActiveLocked(); err != nil {
 		return nil, err
 	}
-
-	if manifestStale {
+	if stale {
 		if err := l.persistManifestLocked(); err != nil {
 			l.activeFile.Close()
 			return nil, err
 		}
 	}
-
 	return l, nil
+}
+
+// replaySegments는 매니페스트의 모든 segment를 디스크에서 스캔해 인메모리 상태를
+// 채운다. 활성 segment의 tail truncation은 stale=true로 알려 호출부가 매니페스트
+// 갱신을 결정하게 한다.
+func (l *Log) replaySegments() (stale bool, err error) {
+	for i, sm := range l.manifest.segments {
+		isActive := i == len(l.manifest.segments)-1
+		ss, truncated, err := scanSegment(l.dir, sm, isActive)
+		if err != nil {
+			return false, err
+		}
+		if !isActive {
+			if err := verifySealedMeta(sm, ss); err != nil {
+				return false, err
+			}
+		}
+		if truncated {
+			stale = true
+		}
+		l.segments = append(l.segments, ss)
+	}
+	return stale, nil
+}
+
+// verifySealedMeta는 봉인 segment의 매니페스트 메타와 디스크 스캔 결과가 일치하는지
+// 검증한다. 어긋나면 매니페스트 손상.
+func verifySealedMeta(sm segmentMeta, ss *segState) error {
+	if ss.firstIndex == sm.firstIndex && ss.lastIndex == sm.lastIndex && ss.size == sm.size {
+		return nil
+	}
+	return fmt.Errorf("%w: sealed segment seq=%d disk=%d..%d/%dB manifest=%d..%d/%dB",
+		ErrManifestCorrupt, sm.seq,
+		ss.firstIndex, ss.lastIndex, ss.size,
+		sm.firstIndex, sm.lastIndex, sm.size)
 }
 
 // FirstIndex는 로그에 남아 있는 첫 entry의 index를 반환한다. 비어 있으면 0.
