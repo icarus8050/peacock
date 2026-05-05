@@ -107,23 +107,24 @@ func pathsForRead(dir string) (checkpoint string, segments []string, err error) 
 	if err != nil {
 		return "", nil, err
 	}
-	if m != nil {
-		if err := verifyManifestArtifacts(dir, m); err != nil {
-			return "", nil, err
-		}
-		if m.checkpointSeq > 0 {
-			checkpoint = checkpointPath(dir, m.checkpointSeq)
-		}
-		segments = make([]string, len(m.segments))
-		for i, s := range m.segments {
-			segments[i] = segmentPath(dir, s)
-		}
-		return checkpoint, segments, nil
+	if m == nil {
+		return pathsFromDiskScan(dir)
 	}
-	// 매니페스트 부재 = 첫 기동 또는 pre-manifest 데이터. 정의상 체크포인트는 매니페스트
-	// commit 후에만 의미를 가지므로 매니페스트 없이 디스크에 *.checkpoint 파일이 떠
-	// 있더라도 그것은 commit 안 된 고아 — 무시한다. listSegments는 .log suffix만
-	// 보므로 checkpoint 파일은 자연스럽게 제외된다.
+	if err := verifyManifestArtifacts(dir, m); err != nil {
+		return "", nil, err
+	}
+	if m.checkpointSeq > 0 {
+		checkpoint = checkpointPath(dir, m.checkpointSeq)
+	}
+	return checkpoint, segmentsToPaths(dir, m.segments), nil
+}
+
+// pathsFromDiskScan은 매니페스트가 없을 때(첫 기동 또는 pre-manifest 데이터) 디스크의
+// segment 파일 목록으로 fallback한다. 정의상 체크포인트는 매니페스트 commit 후에만
+// 의미를 가지므로 매니페스트 없이 디스크에 *.checkpoint 파일이 떠 있더라도 그것은
+// commit 안 된 고아 — 무시한다. listSegments는 .log suffix만 보므로 checkpoint
+// 파일은 자연스럽게 제외된다. segment도 없으면 wrapped os.ErrNotExist.
+func pathsFromDiskScan(dir string) (string, []string, error) {
 	seqs, err := listSegments(dir)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
@@ -134,11 +135,16 @@ func pathsForRead(dir string) (checkpoint string, segments []string, err error) 
 	if len(seqs) == 0 {
 		return "", nil, fmt.Errorf("wal: open: %w", os.ErrNotExist)
 	}
-	segments = make([]string, len(seqs))
+	return "", segmentsToPaths(dir, seqs), nil
+}
+
+// segmentsToPaths는 segment seq 목록을 디스크 경로 목록으로 매핑한다.
+func segmentsToPaths(dir string, seqs []int64) []string {
+	paths := make([]string, len(seqs))
 	for i, s := range seqs {
-		segments[i] = segmentPath(dir, s)
+		paths[i] = segmentPath(dir, s)
 	}
-	return "", segments, nil
+	return paths
 }
 
 // verifyManifestArtifacts는 매니페스트의 invariant와 참조 파일 존재를 검증한다.
@@ -159,13 +165,14 @@ func verifyManifestArtifacts(dir string, m *manifest) error {
 // verifyCheckpointExists는 매니페스트가 참조하는 체크포인트 파일이 디스크에
 // 존재하는지 확인한다. 누락 시 ErrMissingCheckpoint(wrap)로 중단.
 func verifyCheckpointExists(dir string, seq int64) error {
-	if _, err := os.Stat(checkpointPath(dir, seq)); err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return fmt.Errorf("%w: seq=%d", ErrMissingCheckpoint, seq)
-		}
-		return fmt.Errorf("wal: stat checkpoint: %w", err)
+	_, err := os.Stat(checkpointPath(dir, seq))
+	if err == nil {
+		return nil
 	}
-	return nil
+	if errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("%w: seq=%d", ErrMissingCheckpoint, seq)
+	}
+	return fmt.Errorf("wal: stat checkpoint: %w", err)
 }
 
 // verifySegmentsExist는 매니페스트가 참조하는 모든 세그먼트가 디스크에 존재하는지
@@ -173,14 +180,24 @@ func verifyCheckpointExists(dir string, seq int64) error {
 // 일치하는 상태에서만 진행하도록 강제한다.
 func verifySegmentsExist(dir string, segments []int64) error {
 	for _, seq := range segments {
-		if _, err := os.Stat(segmentPath(dir, seq)); err != nil {
-			if errors.Is(err, os.ErrNotExist) {
-				return fmt.Errorf("%w: seq=%d", ErrMissingSegment, seq)
-			}
-			return fmt.Errorf("wal: stat segment: %w", err)
+		if err := requireSegmentExists(dir, seq); err != nil {
+			return err
 		}
 	}
 	return nil
+}
+
+// requireSegmentExists는 단일 segment 파일이 존재하는지 확인하고 부재/접근 오류를
+// 도메인 에러(ErrMissingSegment 또는 wrap)로 분류한다.
+func requireSegmentExists(dir string, seq int64) error {
+	_, err := os.Stat(segmentPath(dir, seq))
+	if err == nil {
+		return nil
+	}
+	if errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("%w: seq=%d", ErrMissingSegment, seq)
+	}
+	return fmt.Errorf("wal: stat segment: %w", err)
 }
 
 // encode는 매니페스트를 디스크 바이너리 형식으로 직렬화한다.

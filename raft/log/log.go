@@ -684,6 +684,22 @@ func (l *Log) openActiveLocked() error {
 // isActive=false면 corruption은 fatal.
 func scanSegment(dir string, sm segmentMeta, isActive bool) (*segState, bool, error) {
 	path := segmentPath(dir, sm.seq)
+	ss, truncated, err := readSegmentEntries(path, sm, isActive)
+	if err != nil {
+		return nil, false, err
+	}
+	if truncated {
+		if err := truncateTailTo(path, ss.size); err != nil {
+			return nil, false, err
+		}
+	}
+	return ss, truncated, nil
+}
+
+// readSegmentEntries는 segment 파일을 처음부터 읽어 인메모리 segState를 만든다.
+// 활성 segment에서 tail corruption이 감지되면 truncated=true로 알리고 그 지점까지의
+// 결과를 반환한다 — 디스크 파일 절단은 호출자(scanSegment)가 수행.
+func readSegmentEntries(path string, sm segmentMeta, isActive bool) (*segState, bool, error) {
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDONLY, 0644)
 	if err != nil {
 		return nil, false, fmt.Errorf("raftlog: open segment for scan: %w", err)
@@ -693,75 +709,100 @@ func scanSegment(dir string, sm segmentMeta, isActive bool) (*segState, bool, er
 	br := bufio.NewReader(f)
 	ss := &segState{seq: sm.seq}
 	var off int64
-	var lenBuf [lenSize]byte
-	truncated := false
 
 	for {
-		_, err := io.ReadFull(br, lenBuf[:])
-		if errors.Is(err, io.EOF) {
-			break
-		}
-		if errors.Is(err, io.ErrUnexpectedEOF) {
-			if !isActive {
-				return nil, false, fmt.Errorf("raftlog: sealed segment seq=%d truncated header at %d", sm.seq, off)
-			}
-			truncated = true
-			break
-		}
+		entry, encoded, result, err := readNextEntry(br, sm, off, isActive)
 		if err != nil {
-			return nil, false, fmt.Errorf("raftlog: read length: %w", err)
-		}
-		totalLen := binary.LittleEndian.Uint32(lenBuf[:])
-
-		body := make([]byte, totalLen)
-		if _, err := io.ReadFull(br, body); err != nil {
-			if !isActive {
-				return nil, false, fmt.Errorf("raftlog: sealed segment seq=%d truncated body at %d", sm.seq, off)
-			}
-			truncated = true
-			break
-		}
-
-		entry, err := decodeBody(body)
-		if err != nil {
-			if errors.Is(err, ErrChecksumMismatch) || errors.Is(err, ErrIncompleteEntry) {
-				if !isActive {
-					return nil, false, fmt.Errorf("raftlog: sealed segment seq=%d corrupt entry at %d: %w", sm.seq, off, err)
-				}
-				truncated = true
-				break
-			}
 			return nil, false, err
 		}
-
+		if result == scanEOF {
+			ss.size = off
+			return ss, false, nil
+		}
+		if result == scanTailDamage {
+			ss.size = off
+			return ss, true, nil
+		}
 		ss.entries = append(ss.entries, entryLoc{offset: off, term: entry.Term})
 		if ss.firstIndex == 0 {
 			ss.firstIndex = entry.Index
 		}
 		ss.lastIndex = entry.Index
-		off += int64(lenSize) + int64(totalLen)
+		off += int64(encoded)
+	}
+}
+
+type scanResult int
+
+const (
+	scanOK scanResult = iota
+	scanEOF
+	scanTailDamage
+)
+
+// readNextEntry는 br에서 다음 entry 하나를 읽어 분류한다.
+//   - scanOK: entry/encoded가 유효, 호출자가 누적
+//   - scanEOF: 정상 EOF (tail truncation 아님)
+//   - scanTailDamage: 활성 segment의 tail corruption (header/body 절단 또는 CRC 오류)
+//
+// 봉인 segment에서 동일한 손상이 보이면 fatal 에러로 반환한다.
+func readNextEntry(br *bufio.Reader, sm segmentMeta, off int64, isActive bool) (Entry, int, scanResult, error) {
+	var lenBuf [lenSize]byte
+	if _, err := io.ReadFull(br, lenBuf[:]); err != nil {
+		if errors.Is(err, io.EOF) {
+			return Entry{}, 0, scanEOF, nil
+		}
+		if errors.Is(err, io.ErrUnexpectedEOF) {
+			return tailOrSealed(isActive, sm, off, "truncated header", nil)
+		}
+		return Entry{}, 0, 0, fmt.Errorf("raftlog: read length: %w", err)
+	}
+	totalLen := binary.LittleEndian.Uint32(lenBuf[:])
+
+	body := make([]byte, totalLen)
+	if _, err := io.ReadFull(br, body); err != nil {
+		return tailOrSealed(isActive, sm, off, "truncated body", nil)
 	}
 
-	ss.size = off
-
-	// 활성 segment에서 truncation이 발생했으면 디스크 파일도 절단해 다음 Append가 깨끗한
-	// 상태에서 시작하게 한다.
-	if truncated {
-		wf, err := os.OpenFile(path, os.O_RDWR, 0644)
-		if err != nil {
-			return nil, false, fmt.Errorf("raftlog: open for tail truncate: %w", err)
+	entry, err := decodeBody(body)
+	if err != nil {
+		if errors.Is(err, ErrChecksumMismatch) || errors.Is(err, ErrIncompleteEntry) {
+			return tailOrSealed(isActive, sm, off, "corrupt entry", err)
 		}
-		if err := wf.Truncate(off); err != nil {
-			wf.Close()
-			return nil, false, fmt.Errorf("raftlog: truncate tail: %w", err)
-		}
-		if err := wf.Sync(); err != nil {
-			wf.Close()
-			return nil, false, fmt.Errorf("raftlog: fsync tail truncate: %w", err)
-		}
-		if err := wf.Close(); err != nil {
-			return nil, false, fmt.Errorf("raftlog: close tail truncate: %w", err)
-		}
+		return Entry{}, 0, 0, err
 	}
-	return ss, truncated, nil
+	return entry, lenSize + int(totalLen), scanOK, nil
+}
+
+// tailOrSealed는 tail-style 손상에 대한 정책 분기를 한 곳으로 모은다 — 활성이면
+// scanTailDamage로 정상 종료, 봉인이면 fatal 에러.
+func tailOrSealed(isActive bool, sm segmentMeta, off int64, msg string, src error) (Entry, int, scanResult, error) {
+	if isActive {
+		return Entry{}, 0, scanTailDamage, nil
+	}
+	if src == nil {
+		return Entry{}, 0, 0, fmt.Errorf("raftlog: sealed segment seq=%d %s at %d", sm.seq, msg, off)
+	}
+	return Entry{}, 0, 0, fmt.Errorf("raftlog: sealed segment seq=%d %s at %d: %w", sm.seq, msg, off, src)
+}
+
+// truncateTailTo는 활성 segment의 디스크 파일을 size 바이트로 절단해 다음 Append가
+// 깨끗한 상태에서 시작하게 한다.
+func truncateTailTo(path string, size int64) error {
+	wf, err := os.OpenFile(path, os.O_RDWR, 0644)
+	if err != nil {
+		return fmt.Errorf("raftlog: open for tail truncate: %w", err)
+	}
+	if err := wf.Truncate(size); err != nil {
+		wf.Close()
+		return fmt.Errorf("raftlog: truncate tail: %w", err)
+	}
+	if err := wf.Sync(); err != nil {
+		wf.Close()
+		return fmt.Errorf("raftlog: fsync tail truncate: %w", err)
+	}
+	if err := wf.Close(); err != nil {
+		return fmt.Errorf("raftlog: close tail truncate: %w", err)
+	}
+	return nil
 }
