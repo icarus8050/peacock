@@ -585,20 +585,8 @@ func (l *Log) truncateSegmentToLocked(segIdx int, cutOffset int64, newLastIndex 
 		l.closed = true
 		return fmt.Errorf("raftlog: truncate file: %w", err)
 	}
-	if err := f.Sync(); err != nil {
-		f.Close()
-		l.closed = true
-		return fmt.Errorf("raftlog: fsync after truncate: %w", err)
-	}
-	// O_APPEND로 다시 열어 활성으로 사용.
-	if err := f.Close(); err != nil {
-		l.closed = true
-		return fmt.Errorf("raftlog: close after truncate: %w", err)
-	}
-	active, err := os.OpenFile(path, os.O_RDWR|os.O_APPEND, 0644)
-	if err != nil {
-		l.closed = true
-		return fmt.Errorf("raftlog: reopen active after truncate: %w", err)
+	if err := l.reopenAsActiveLocked(f, path); err != nil {
+		return err
 	}
 
 	// 인메모리 entries 절단.
@@ -612,9 +600,6 @@ func (l *Log) truncateSegmentToLocked(segIdx int, cutOffset int64, newLastIndex 
 		seg.lastIndex = newLastIndex
 	}
 	seg.size = cutOffset
-
-	l.activeFile = active
-	l.activeWriter = bufio.NewWriterSize(active, l.opts.BufferSize)
 	return nil
 }
 
@@ -628,26 +613,35 @@ func (l *Log) resetActiveLocked() error {
 		l.closed = true
 		return fmt.Errorf("raftlog: reset active: %w", err)
 	}
-	if err := f.Sync(); err != nil {
-		f.Close()
-		l.closed = true
-		return fmt.Errorf("raftlog: fsync reset active: %w", err)
-	}
-	if err := f.Close(); err != nil {
-		l.closed = true
-		return fmt.Errorf("raftlog: close reset active: %w", err)
-	}
-	active, err := os.OpenFile(path, os.O_RDWR|os.O_APPEND, 0644)
-	if err != nil {
-		l.closed = true
-		return fmt.Errorf("raftlog: reopen active after reset: %w", err)
+	if err := l.reopenAsActiveLocked(f, path); err != nil {
+		return err
 	}
 
 	seg.entries = seg.entries[:0]
 	seg.firstIndex = 0
 	seg.lastIndex = 0
 	seg.size = 0
+	return nil
+}
 
+// reopenAsActiveLocked는 modify된 파일 f를 fsync + close 후 path를 O_APPEND로 다시
+// 열어 활성 segment로 설정한다. truncate/reset 직후 활성 segment를 안전하게
+// 재오픈하는 공통 경로 — 어느 단계든 실패 시 WAL을 closed로 전환한다.
+func (l *Log) reopenAsActiveLocked(f *os.File, path string) error {
+	if err := f.Sync(); err != nil {
+		f.Close()
+		l.closed = true
+		return fmt.Errorf("raftlog: fsync active rewrite: %w", err)
+	}
+	if err := f.Close(); err != nil {
+		l.closed = true
+		return fmt.Errorf("raftlog: close active rewrite: %w", err)
+	}
+	active, err := os.OpenFile(path, os.O_RDWR|os.O_APPEND, 0644)
+	if err != nil {
+		l.closed = true
+		return fmt.Errorf("raftlog: reopen active: %w", err)
+	}
 	l.activeFile = active
 	l.activeWriter = bufio.NewWriterSize(active, l.opts.BufferSize)
 	return nil
