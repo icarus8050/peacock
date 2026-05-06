@@ -80,7 +80,10 @@ func SaveHardState(dir string, hs HardState) error {
 	if err := os.Rename(tmpPath, finalPath); err != nil {
 		return fmt.Errorf("raft: rename hardstate: %w", err)
 	}
-	return fsutil.SyncDir(dir)
+	if err := fsutil.SyncDir(dir); err != nil {
+		return fmt.Errorf("raft: fsync hardstate dir: %w", err)
+	}
+	return nil
 }
 
 // 레이아웃 (little-endian):
