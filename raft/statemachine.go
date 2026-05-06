@@ -11,10 +11,9 @@ type StateMachine interface {
 	Apply(entry Entry) (result any, err error)
 
 	// Snapshot은 현 상태의 직렬화 스트림을 반환한다.
-	// 호출자는 ReadCloser를 반드시 닫는다. M2까지는 호출되지 않는다.
+	// 호출자는 ReadCloser를 반드시 닫는다.
 	Snapshot() (io.ReadCloser, error)
 
 	// Restore는 Snapshot이 만든 스트림으로부터 상태를 복원한다.
-	// M2까지는 호출되지 않는다.
 	Restore(io.Reader) error
 }

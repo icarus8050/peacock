@@ -10,7 +10,7 @@ type RequestVoteArgs struct {
 	CandidateID  NodeID
 	LastLogIndex uint64
 	LastLogTerm  uint64
-	PreVote      bool // M1에서는 미사용
+	PreVote      bool
 }
 
 type RequestVoteReply struct {
