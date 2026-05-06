@@ -7,6 +7,8 @@ import (
 	"hash/crc32"
 	"os"
 	"path/filepath"
+
+	"peacock/internal/fsutil"
 )
 
 const (
@@ -243,20 +245,8 @@ func writeManifest(dir string, m *manifest) error {
 	if err := os.Rename(tmpPath, finalPath); err != nil {
 		return fmt.Errorf("raftlog: rename manifest: %w", err)
 	}
-	if err := syncDir(dir); err != nil {
+	if err := fsutil.SyncDir(dir); err != nil {
 		return fmt.Errorf("raftlog: fsync manifest dir: %w", err)
 	}
 	return nil
-}
-
-func syncDir(dir string) error {
-	d, err := os.Open(dir)
-	if err != nil {
-		return err
-	}
-	if err := d.Sync(); err != nil {
-		d.Close()
-		return err
-	}
-	return d.Close()
 }

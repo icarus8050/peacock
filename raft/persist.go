@@ -8,6 +8,8 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+
+	"peacock/internal/fsutil"
 )
 
 // HardState는 reboot 사이에 영속화되어야 하는 최소 상태(Raft 논문 fig.2의 영속 상태
@@ -78,7 +80,7 @@ func SaveHardState(dir string, hs HardState) error {
 	if err := os.Rename(tmpPath, finalPath); err != nil {
 		return fmt.Errorf("raft: rename hardstate: %w", err)
 	}
-	return syncDir(dir)
+	return fsutil.SyncDir(dir)
 }
 
 // 레이아웃 (little-endian):
@@ -131,16 +133,4 @@ func decodeHardState(buf []byte) (HardState, error) {
 		return HardState{}, fmt.Errorf("%w: crc mismatch", ErrHardstateCorrupt)
 	}
 	return HardState{Term: term, VotedFor: NodeID(voted)}, nil
-}
-
-func syncDir(dir string) error {
-	d, err := os.Open(dir)
-	if err != nil {
-		return err
-	}
-	if err := d.Sync(); err != nil {
-		d.Close()
-		return err
-	}
-	return d.Close()
 }
