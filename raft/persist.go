@@ -109,30 +109,30 @@ func encodeHardState(hs HardState) []byte {
 	return buf
 }
 
-func decodeHardState(buf []byte) (HardState, error) {
-	if len(buf) < hardstateMinSize {
-		return HardState{}, fmt.Errorf("%w: too short (%d)", ErrHardstateCorrupt, len(buf))
+func decodeHardState(data []byte) (HardState, error) {
+	if len(data) < hardstateMinSize {
+		return HardState{}, fmt.Errorf("%w: too short (%d)", ErrHardstateCorrupt, len(data))
 	}
-	if string(buf[:4]) != hardstateMagic {
-		return HardState{}, fmt.Errorf("%w: bad magic %q", ErrHardstateCorrupt, buf[:4])
+	if string(data[:4]) != hardstateMagic {
+		return HardState{}, fmt.Errorf("%w: bad magic %q", ErrHardstateCorrupt, data[:4])
 	}
 	off := 4
-	version := binary.LittleEndian.Uint16(buf[off : off+2])
+	version := binary.LittleEndian.Uint16(data[off : off+2])
 	if version != hardstateVersion {
 		return HardState{}, fmt.Errorf("%w: bad version %d", ErrHardstateCorrupt, version)
 	}
 	off += 2
-	term := binary.LittleEndian.Uint64(buf[off : off+8])
+	term := binary.LittleEndian.Uint64(data[off : off+8])
 	off += 8
-	votedLen := int(binary.LittleEndian.Uint16(buf[off : off+2]))
+	votedLen := int(binary.LittleEndian.Uint16(data[off : off+2]))
 	off += 2
-	if len(buf) < off+votedLen+4 {
+	if len(data) < off+votedLen+4 {
 		return HardState{}, fmt.Errorf("%w: votedFor truncated", ErrHardstateCorrupt)
 	}
-	voted := string(buf[off : off+votedLen])
+	voted := string(data[off : off+votedLen])
 	off += votedLen
-	storedCRC := binary.LittleEndian.Uint32(buf[off : off+4])
-	if crc32.ChecksumIEEE(buf[:off]) != storedCRC {
+	storedCRC := binary.LittleEndian.Uint32(data[off : off+4])
+	if crc32.ChecksumIEEE(data[:off]) != storedCRC {
 		return HardState{}, fmt.Errorf("%w: crc mismatch", ErrHardstateCorrupt)
 	}
 	return HardState{Term: term, VotedFor: NodeID(voted)}, nil
