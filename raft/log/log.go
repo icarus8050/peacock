@@ -75,7 +75,7 @@ func Open(opts Options) (*Log, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := l.openActiveLocked(); err != nil {
+	if err := l.openActive(); err != nil {
 		return nil, err
 	}
 	if stale {
@@ -671,9 +671,10 @@ func (l *Log) persistManifestLocked(segments []*segState) error {
 	return nil
 }
 
-// openActiveLocked는 활성 segment의 파일 핸들을 RDWR+APPEND로 연다.
-// scanSegment가 size를 이미 정확히 채워두므로 이 함수는 그저 파일만 연다.
-func (l *Log) openActiveLocked() error {
+// openActive는 활성 segment의 파일 핸들과 buffered writer를 Log에 부착한다.
+// Open()의 부트스트랩 단계에서 한 번만 호출 — Log가 아직 공유되기 전이라 락 무관.
+// scanSegment가 size를 이미 정확히 채워두므로 이 함수는 파일을 열어 writer만 묶는다.
+func (l *Log) openActive() error {
 	active := l.segments[len(l.segments)-1]
 	path := segmentPath(l.dir, active.seq)
 	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0644)
