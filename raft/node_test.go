@@ -42,9 +42,10 @@ func newTestNode(t *testing.T) *Node {
 	dir := t.TempDir()
 	cfg := Config{
 		ID:                 "node-1",
-		HeartbeatInterval:  20 * time.Millisecond,
-		ElectionTimeoutMin: 50 * time.Millisecond,
-		ElectionTimeoutMax: 100 * time.Millisecond,
+		TickInterval:       1 * time.Millisecond,
+		HeartbeatInterval:  2 * time.Millisecond,
+		ElectionTimeoutMin: 5 * time.Millisecond,
+		ElectionTimeoutMax: 10 * time.Millisecond,
 		Dir:                dir,
 	}
 	n, err := NewNode(cfg, stubLog{}, stubSM{}, stubTransport{}, []PeerInfo{
@@ -75,6 +76,36 @@ func TestNewNode_RequiredFields(t *testing.T) {
 				t.Fatalf("expected error, got nil")
 			}
 		})
+	}
+}
+
+func TestNewNode_RejectsNonMultipleInterval(t *testing.T) {
+	cfg := Config{
+		ID:                 "node-1",
+		Dir:                t.TempDir(),
+		TickInterval:       10 * time.Millisecond,
+		HeartbeatInterval:  15 * time.Millisecond, // 10ms의 배수가 아님
+		ElectionTimeoutMin: 50 * time.Millisecond,
+		ElectionTimeoutMax: 100 * time.Millisecond,
+	}
+	_, err := NewNode(cfg, stubLog{}, stubSM{}, stubTransport{}, nil)
+	if err == nil {
+		t.Fatalf("expected error for non-multiple HeartbeatInterval, got nil")
+	}
+}
+
+func TestNewNode_RejectsMaxLessThanMin(t *testing.T) {
+	cfg := Config{
+		ID:                 "node-1",
+		Dir:                t.TempDir(),
+		TickInterval:       10 * time.Millisecond,
+		HeartbeatInterval:  100 * time.Millisecond,
+		ElectionTimeoutMin: 100 * time.Millisecond,
+		ElectionTimeoutMax: 50 * time.Millisecond, // < min
+	}
+	_, err := NewNode(cfg, stubLog{}, stubSM{}, stubTransport{}, nil)
+	if err == nil {
+		t.Fatalf("expected error for ElectionTimeoutMax < Min, got nil")
 	}
 }
 
@@ -111,6 +142,27 @@ func TestNode_StartStop(t *testing.T) {
 	case <-done:
 	case <-time.After(time.Second):
 		t.Fatalf("Stop did not return within timeout")
+	}
+}
+
+func TestOnTick_AdvancesElapsedAndCyclesAtTimeout(t *testing.T) {
+	n := newTestNode(t)
+	n.electionElapsedTicks = 0
+	n.electionTimeoutTicks = 3 // randomized 값을 결정적으로 덮어씀
+
+	n.onTick()
+	n.onTick()
+	if n.electionElapsedTicks != 2 {
+		t.Fatalf("expected elapsed=2 after 2 ticks, got %d", n.electionElapsedTicks)
+	}
+
+	n.onTick() // 3번째 — elapsed가 timeout에 도달해 cycle 리셋
+	if n.electionElapsedTicks != 0 {
+		t.Fatalf("expected elapsed=0 after timeout, got %d", n.electionElapsedTicks)
+	}
+	if n.electionTimeoutTicks < n.electionTimeoutMinTicks || n.electionTimeoutTicks >= n.electionTimeoutMaxTicks {
+		t.Fatalf("electionTimeoutTicks=%d out of [%d, %d)",
+			n.electionTimeoutTicks, n.electionTimeoutMinTicks, n.electionTimeoutMaxTicks)
 	}
 }
 
