@@ -58,6 +58,14 @@ func (n *Node) becomeLeader() {
 
 // persistHardState는 현재 currentTerm/votedFor를 디스크에 영속화한다. role 전이
 // 메서드들이 term/votedFor 갱신 후 호출.
+//
+// 호출자의 실패 처리 정책 (의도된 비대칭):
+//   - RPC handler 경로(HandleRequestVote 등): 에러를 호출자에게 반환 — 응답 의무가 있고
+//     persist 실패는 invariant 깨짐이라 RPC 실패로 보고해야 한다.
+//   - 비동기 timeout 경로(startElectionLocked 등): silent drop — 응답 의무가 없고
+//     다음 election timeout에서 자연 재시도된다.
+//
+// logger 도입 시 후자도 최소한 로그는 남길 자리.
 func (n *Node) persistHardState() error {
 	return SaveHardState(n.cfg.Dir, HardState{
 		Term:     n.currentTerm,

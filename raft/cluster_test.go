@@ -61,8 +61,10 @@ func (c *cluster) tickAll(n int) {
 	}
 }
 
-// kill은 노드를 freeze한다 — 이후 tick에서 제외된다. hardstate는 dir에 남는다.
+// kill은 노드를 freeze한다 — 이후 tick에서 제외되고 hub에서 unregister되어
+// 다른 노드가 보낸 RPC도 라우팅 실패한다. hardstate는 dir에 남는다.
 func (c *cluster) kill(idx int) {
+	c.hub.Unregister(c.ids[idx])
 	c.alive[idx] = false
 }
 
@@ -92,6 +94,7 @@ func bootNode(t *testing.T, hub *inMemHub, id NodeID, dir string, peers []PeerIn
 	if err != nil {
 		t.Fatalf("bootNode %s: %v", id, err)
 	}
+	hub.Register(id, node)
 	return node
 }
 
@@ -135,6 +138,60 @@ func TestCluster_KillStopsTicks(t *testing.T) {
 		if c.nodes[idx].electionElapsedTicks != 2 {
 			t.Fatalf("alive node[%d] should have elapsed=2, got %d", idx, c.nodes[idx].electionElapsedTicks)
 		}
+	}
+}
+
+func TestCluster_ElectsLeader(t *testing.T) {
+	// 3노드에서 한 candidate에 quorum이 모이는 정상 경로를 검증한다.
+	// 노드 0에 가장 짧은 timeout을 부여해 결정적으로 가장 먼저 candidate 진입.
+	// 다른 두 노드의 timeout은 충분히 크게 잡아 같은 사이클에서 동시 candidate가 안 되게 한다.
+	//
+	// 주의: 첫 grant로 quorum이 채워지면 startElection 루프가 break하므로 두 번째
+	// peer엔 RequestVote가 도달하지 않을 수 있다 — 그 peer의 term은 0으로 남는다.
+	// 따라서 "모든 노드의 term=1"은 invariant가 아니다. leader 등장과 leader 자신의
+	// term이 1이라는 점만 검증한다 — follower 동기화는 heartbeat 단계에서 본다.
+	c := newCluster(t, 3)
+	c.nodes[0].electionTimeoutTicks = 3
+	c.nodes[1].electionTimeoutTicks = 100
+	c.nodes[2].electionTimeoutTicks = 100
+	for _, n := range c.nodes {
+		n.electionElapsedTicks = 0
+	}
+
+	c.tickAll(3)
+
+	leaders := 0
+	for _, n := range c.nodes {
+		if n.role == RoleLeader {
+			leaders++
+		}
+	}
+	if leaders != 1 {
+		t.Fatalf("expected exactly 1 leader, got %d", leaders)
+	}
+	if c.nodes[0].role != RoleLeader {
+		t.Fatalf("expected node-0 to be leader, role=%v", c.nodes[0].role)
+	}
+	if c.nodes[0].currentTerm != 1 {
+		t.Fatalf("leader term=%d, want 1", c.nodes[0].currentTerm)
+	}
+}
+
+func TestCluster_NoQuorumStaysCandidate(t *testing.T) {
+	// 노드 0만 alive, 나머지는 kill — quorum 부족. 노드 0은 candidate에 머무른다.
+	c := newCluster(t, 3)
+	c.kill(1)
+	c.kill(2)
+	c.nodes[0].electionTimeoutTicks = 3
+	c.nodes[0].electionElapsedTicks = 0
+
+	c.tickAll(3)
+
+	if c.nodes[0].role != RoleCandidate {
+		t.Fatalf("expected candidate without quorum, got %v", c.nodes[0].role)
+	}
+	if c.nodes[0].currentTerm != 1 {
+		t.Fatalf("expected term=1 after one election, got %d", c.nodes[0].currentTerm)
 	}
 }
 

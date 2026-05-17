@@ -38,6 +38,12 @@
 - 가변 상태를 갖거나 `sync.Mutex`를 임베드한 타입은 포인터 리시버를 사용한다.
 - 한 타입의 모든 메서드 리시버 종류는 통일한다 (값/포인터 혼용 금지).
 
+## 명명
+
+- 함수 이름은 가장 큰 책임을 앞에 둔다. 송신과 응답 분류를 같이 들면 송신 동사가 앞 — `requestVoteFrom(id, args) (terminate, granted bool)`처럼. 책임이 이름에서 가려지면 다음 작업자가 함수의 의도를 잘못 읽는다.
+- **`handle*` 접두사는 인입 이벤트·메시지·RPC를 dispatch하는 메서드에만** 쓴다. 예: `HandleRequestVote`는 RPCHandler 인터페이스 구현으로 인입 RPC를 받아 처리. 송신·요청을 시작하는 메서드에는 `request*`, `send*`, `call*`, `solicit*` 등 동사 접두사를 쓴다. 같은 파일에 `HandleX`와 `handleY`가 공존하면 두 의미가 충돌하므로 후자를 동사로 리네임.
+- getter는 `Get` 접두사 회피(Go 관용) — 필드명 그대로 메서드명으로 (예: `Term()` not `GetTerm()`).
+
 ## 주석
 
 - Exported 식별자에 한해 doc 주석을 작성한다. 이름만으로 자명하면 생략한다.
@@ -192,6 +198,21 @@ func requireSegmentExists(dir string, seq int64) error {
 ### 분리 기준 — error는 항상 별도
 
 `(domainResult, error)` 형태가 Go 관용구. error는 도메인 객체에 섞지 않는다 (Go의 errors.Is/As 흐름과 충돌).
+
+### struct vs enum — 동질 bool은 보통 enum
+
+`(bool, bool)` 같은 동질 타입 2-tuple은 보통 enum이 더 자연. 두 bool은 4가지 조합인데 실제 도메인은 3가지 이하인 경우가 많고, struct(bool, bool)은 그 invariant를 표현하지 못해 임의 묶음에 가까워진다.
+
+예: `requestVoteFrom`이 `(terminate, granted bool)`을 반환할 때 `(true, true)` 조합은 invariant상 불가능. struct로 묶기보단 3-state enum으로:
+```go
+type voteOutcome int
+const (
+    voteContinue  voteOutcome = iota  // skip — 다음 peer로
+    voteGranted                        // count++ 후 quorum 검사
+    voteTerminate                      // 즉시 종료
+)
+```
+호출부는 `switch`로 분기가 명시되고 4번째 조합 자체가 표현 불가능 — 타입이 invariant를 강제한다. struct는 두 값이 의미적으로 독립이고 동시에 의미 있을 때만 (`(state, truncated)` 같은 경우).
 
 ### 예시
 

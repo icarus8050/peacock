@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"math/rand"
+	"sync"
 	"time"
 )
 
@@ -47,9 +48,12 @@ func (c Config) withDefaults() Config {
 // ErrStopped는 정지된 Node에 대한 호출에 반환된다.
 var ErrStopped = errors.New("raft: node stopped")
 
-// Node는 Raft 알고리즘의 한 노드. 모든 상태 변경은 단일 goroutine(run)에서
-// 직렬화된다 — 외부는 채널/메서드를 통해 입력을 보내고 응답을 받는다.
+// Node는 Raft 알고리즘의 한 노드. tick goroutine과 외부 RPC handler 호출이
+// 동시에 들어오므로 mu로 상태 접근을 직렬화한다 — 외부에서 호출 가능한 모든
+// 진입점(onTick, HandleRequestVote, HandleAppendEntries)이 mu를 잡는다.
+// 자기 mu를 잡은 채 다른 노드의 RPC handler를 호출해도 노드별 mu라 데드락 없음.
 type Node struct {
+	mu        sync.Mutex
 	cfg       Config
 	log       Log
 	sm        StateMachine
@@ -208,7 +212,7 @@ func (n *Node) runTickLoop() {
 	}
 }
 
-// run은 Node의 메인 이벤트 루프 — 모든 상태 변경이 여기서 직렬화된다.
+// run은 Node의 메인 이벤트 루프 — tick 채널을 읽어 onTick에 디스패치한다.
 func (n *Node) run() {
 	defer close(n.runDone)
 	for {
@@ -222,12 +226,24 @@ func (n *Node) run() {
 }
 
 // onTick은 한 tick 진행을 처리한다. follower/candidate에서 election timeout이
-// 가까워지는 카운터를 굴리며, 도달하면 새 election cycle로 진입한다.
+// 도달하면 startElection으로 새 election cycle에 진입한다. leader는 timeout으로
+// step down하지 않는다 — heartbeat tick은 별도 카운터로 다룬다(replication).
 func (n *Node) onTick() {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.onTickLocked()
+}
+
+func (n *Node) onTickLocked() {
 	n.electionElapsedTicks++
-	if n.electionElapsedTicks >= n.electionTimeoutTicks {
-		n.resetElectionTimeout()
+	if n.electionElapsedTicks < n.electionTimeoutTicks {
+		return
 	}
+	if n.role == RoleLeader {
+		n.resetElectionTimeout()
+		return
+	}
+	n.startElectionLocked()
 }
 
 // resetElectionTimeout은 elapsed를 0으로 되돌리고 randomized timeout을 다시 고른다.
