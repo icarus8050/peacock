@@ -7,10 +7,11 @@ import (
 	"time"
 )
 
-// fakeTransport은 election 단위 테스트에서 reply 시나리오를 결정적으로 통제하기 위한
+// fakeTransport은 단위 테스트에서 reply 시나리오를 결정적으로 통제하기 위한
 // Transport 구현. nil 콜백은 zero reply를 돌려준다.
 type fakeTransport struct {
-	voteReply func(to NodeID, args RequestVoteArgs) (RequestVoteReply, error)
+	voteReply   func(to NodeID, args RequestVoteArgs) (RequestVoteReply, error)
+	appendReply func(to NodeID, args AppendEntriesArgs) (AppendEntriesReply, error)
 }
 
 func (f *fakeTransport) SendRequestVote(_ context.Context, to NodeID, args RequestVoteArgs) (RequestVoteReply, error) {
@@ -20,8 +21,11 @@ func (f *fakeTransport) SendRequestVote(_ context.Context, to NodeID, args Reque
 	return f.voteReply(to, args)
 }
 
-func (f *fakeTransport) SendAppendEntries(_ context.Context, _ NodeID, _ AppendEntriesArgs) (AppendEntriesReply, error) {
-	return AppendEntriesReply{}, nil
+func (f *fakeTransport) SendAppendEntries(_ context.Context, to NodeID, args AppendEntriesArgs) (AppendEntriesReply, error) {
+	if f.appendReply == nil {
+		return AppendEntriesReply{}, nil
+	}
+	return f.appendReply(to, args)
 }
 
 // fakeLog은 up-to-date 비교를 위해 lastIndex/lastTerm을 통제 가능한 Log 구현.
@@ -34,7 +38,7 @@ type fakeLog struct {
 func (l fakeLog) LastIndex() uint64 { return l.lastIndex }
 func (l fakeLog) LastTerm() uint64  { return l.lastTerm }
 
-func newElectionTestNode(t *testing.T, peers []PeerInfo, tx Transport, lg Log) *Node {
+func newRaftTestNode(t *testing.T, peers []PeerInfo, tx Transport, lg Log) *Node {
 	t.Helper()
 	cfg := Config{
 		ID:                 "node-1",
@@ -59,7 +63,7 @@ func newElectionTestNode(t *testing.T, peers []PeerInfo, tx Transport, lg Log) *
 
 func TestStartElection_SingleNodeBecomesLeader(t *testing.T) {
 	// 1노드 cluster — 자기 표만으로 quorum 달성, 즉시 leader.
-	n := newElectionTestNode(t, []PeerInfo{{ID: "node-1"}}, nil, nil)
+	n := newRaftTestNode(t, []PeerInfo{{ID: "node-1"}}, nil, nil)
 	n.startElectionLocked()
 	if n.role != RoleLeader {
 		t.Fatalf("expected RoleLeader, got %v", n.role)
@@ -76,7 +80,7 @@ func TestStartElection_HigherTermReplyStepsDown(t *testing.T) {
 			return RequestVoteReply{Term: 99, VoteGranted: false}, nil
 		},
 	}
-	n := newElectionTestNode(t, []PeerInfo{
+	n := newRaftTestNode(t, []PeerInfo{
 		{ID: "node-1"}, {ID: "node-2"}, {ID: "node-3"},
 	}, tx, nil)
 	n.startElectionLocked()
@@ -95,7 +99,7 @@ func TestStartElection_TransportErrorsTreatedAsNoVote(t *testing.T) {
 			return RequestVoteReply{}, errors.New("network down")
 		},
 	}
-	n := newElectionTestNode(t, []PeerInfo{
+	n := newRaftTestNode(t, []PeerInfo{
 		{ID: "node-1"}, {ID: "node-2"}, {ID: "node-3"},
 	}, tx, nil)
 	n.startElectionLocked()
@@ -106,7 +110,7 @@ func TestStartElection_TransportErrorsTreatedAsNoVote(t *testing.T) {
 
 func TestOnTick_LeaderDoesNotRestartElection(t *testing.T) {
 	// leader는 election timeout 도달 시 elapsed만 리셋하고 candidate로 가지 않는다.
-	n := newElectionTestNode(t, []PeerInfo{
+	n := newRaftTestNode(t, []PeerInfo{
 		{ID: "node-1"}, {ID: "node-2"}, {ID: "node-3"},
 	}, nil, nil)
 	n.role = RoleLeader
@@ -130,7 +134,7 @@ func TestOnTick_LeaderDoesNotRestartElection(t *testing.T) {
 }
 
 func TestHandleRequestVote_StaleTermRejects(t *testing.T) {
-	n := newElectionTestNode(t, nil, nil, nil)
+	n := newRaftTestNode(t, nil, nil, nil)
 	n.currentTerm = 5
 
 	reply, err := n.HandleRequestVote(context.Background(), RequestVoteArgs{
@@ -149,7 +153,7 @@ func TestHandleRequestVote_StaleTermRejects(t *testing.T) {
 
 func TestHandleRequestVote_HigherTermBecomesFollowerAndGrants(t *testing.T) {
 	// 자기 term=2, 다른 candidate가 term=7로 옴 → follower로 점프 + 적격이면 grant.
-	n := newElectionTestNode(t, nil, nil, nil)
+	n := newRaftTestNode(t, nil, nil, nil)
 	n.currentTerm = 2
 	n.votedFor = "node-1"
 	n.role = RoleCandidate
@@ -183,7 +187,7 @@ func TestHandleRequestVote_HigherTermBecomesFollowerAndGrants(t *testing.T) {
 
 func TestHandleRequestVote_RejectsSecondCandidateInSameTerm(t *testing.T) {
 	// 같은 term 안에서 이미 다른 candidate에게 표를 줬다면 두 번째는 거부.
-	n := newElectionTestNode(t, nil, nil, nil)
+	n := newRaftTestNode(t, nil, nil, nil)
 	n.currentTerm = 4
 	n.votedFor = "node-A"
 
@@ -203,7 +207,7 @@ func TestHandleRequestVote_RejectsSecondCandidateInSameTerm(t *testing.T) {
 
 func TestHandleRequestVote_IdempotentGrantToSameCandidate(t *testing.T) {
 	// 같은 candidate가 같은 term으로 두 번 요청해도 모두 grant.
-	n := newElectionTestNode(t, nil, nil, nil)
+	n := newRaftTestNode(t, nil, nil, nil)
 	n.currentTerm = 4
 	n.votedFor = "node-A"
 
@@ -222,7 +226,7 @@ func TestHandleRequestVote_IdempotentGrantToSameCandidate(t *testing.T) {
 
 func TestHandleRequestVote_RejectsStaleLog(t *testing.T) {
 	// 자기 로그가 (term=3, index=5)인데 candidate는 (term=3, index=3) — index가 짧으므로 거부.
-	n := newElectionTestNode(t, nil, nil, fakeLog{lastIndex: 5, lastTerm: 3})
+	n := newRaftTestNode(t, nil, nil, fakeLog{lastIndex: 5, lastTerm: 3})
 
 	reply, err := n.HandleRequestVote(context.Background(), RequestVoteArgs{
 		Term: 4, CandidateID: "node-X",
@@ -245,7 +249,7 @@ func TestHandleRequestVote_RejectsStaleLog(t *testing.T) {
 
 func TestHandleRequestVote_AcceptsEqualLog(t *testing.T) {
 	// up-to-date 경계 — candidate (lastTerm, lastIndex)가 자기와 정확히 같으면 grant.
-	n := newElectionTestNode(t, nil, nil, fakeLog{lastIndex: 5, lastTerm: 3})
+	n := newRaftTestNode(t, nil, nil, fakeLog{lastIndex: 5, lastTerm: 3})
 
 	reply, err := n.HandleRequestVote(context.Background(), RequestVoteArgs{
 		Term: 1, CandidateID: "node-X",
@@ -262,7 +266,7 @@ func TestHandleRequestVote_AcceptsEqualLog(t *testing.T) {
 func TestHandleRequestVote_GrantResetsElectionTimeout(t *testing.T) {
 	// grant 직후 elapsed가 0으로 리셋되어야 — 막 표를 준 노드가 곧장 candidate로
 	// 가버리면 같은 term에 후보가 두 개 생긴다.
-	n := newElectionTestNode(t, nil, nil, nil)
+	n := newRaftTestNode(t, nil, nil, nil)
 	n.electionElapsedTicks = 4
 
 	if _, err := n.HandleRequestVote(context.Background(), RequestVoteArgs{

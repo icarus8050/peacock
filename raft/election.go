@@ -74,18 +74,19 @@ func (n *Node) gatherVotesLocked(args RequestVoteArgs) {
 // requestVoteFrom은 한 peer에 RequestVote를 송신하고 reply 의미를 voteOutcome으로
 // 분류한다.
 //
-// args.Term은 election cycle 식별자로 쓰인다 — 송신 사이에 currentTerm이 더 진전하면
-// 이미 다른 cycle이라 응답을 폐기.
+// 자기 mu를 잡은 채 동기 송신이라 send 중 자기 state는 변경 불가능 — 비동기 응답
+// 모델에서 흔히 보는 "응답 도착 시 cycle 식별자 재검사"는 redundant. 동시성 모델을
+// 바꿀 때 그 검사가 필요해진다.
+//
+// context.Background()는 in-memory transport용 임시 — gRPC transport(M1-F) 도입 시
+// election timeout 기반 WithTimeout으로 교체해야 죽은 peer에 무한 대기하지 않는다.
 func (n *Node) requestVoteFrom(id NodeID, args RequestVoteArgs) voteOutcome {
 	reply, err := n.transport.SendRequestVote(context.Background(), id, args)
 	if err != nil {
 		return voteContinue
 	}
 	if reply.Term > n.currentTerm {
-		_ = n.becomeFollower(reply.Term, "") // persist 실패는 다음 timeout에서 재시도
-		return voteTerminate
-	}
-	if n.role != RoleCandidate || n.currentTerm != args.Term {
+		_ = n.becomeFollower(reply.Term, "") // persist 실패는 임시 silent — logger 도입 자리
 		return voteTerminate
 	}
 	if reply.VoteGranted {

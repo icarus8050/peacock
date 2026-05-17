@@ -77,9 +77,12 @@ type Node struct {
 	electionTimeoutMinTicks int
 	electionTimeoutMaxTicks int
 
-	// election deadline 회계
+	// election deadline 회계 (follower/candidate에서만 의미)
 	electionElapsedTicks int
 	electionTimeoutTicks int
+
+	// heartbeat 회계 (leader에서만 의미 — heartbeatTicks 도달 시 broadcast)
+	heartbeatElapsedTicks int
 
 	rng *rand.Rand
 
@@ -235,15 +238,25 @@ func (n *Node) onTick() {
 }
 
 func (n *Node) onTickLocked() {
-	n.electionElapsedTicks++
-	if n.electionElapsedTicks < n.electionTimeoutTicks {
-		return
-	}
 	if n.role == RoleLeader {
-		n.resetElectionTimeout()
+		n.onLeaderTickLocked()
 		return
 	}
-	n.startElectionLocked()
+	n.electionElapsedTicks++
+	if n.electionElapsedTicks >= n.electionTimeoutTicks {
+		n.startElectionLocked()
+	}
+}
+
+// onLeaderTickLocked은 leader가 매 tick마다 호출한다. heartbeatTicks 도달 시 빈
+// AppendEntries를 broadcast해 follower의 election timeout을 리셋시킨다. leader는
+// election timeout으로 step down하지 않으므로 electionElapsedTicks는 건드리지 않는다.
+func (n *Node) onLeaderTickLocked() {
+	n.heartbeatElapsedTicks++
+	if n.heartbeatElapsedTicks >= n.heartbeatTicks {
+		n.heartbeatElapsedTicks = 0
+		n.broadcastHeartbeatLocked()
+	}
 }
 
 // resetElectionTimeout은 elapsed를 0으로 되돌리고 randomized timeout을 다시 고른다.

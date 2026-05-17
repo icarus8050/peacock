@@ -177,6 +177,43 @@ func TestCluster_ElectsLeader(t *testing.T) {
 	}
 }
 
+func TestCluster_LeaderHeartbeatStabilizes(t *testing.T) {
+	// leader 등장 후 추가 tick에서도 1 leader가 유지된다는 안정성 검증.
+	// Phase 1 heartbeat이 follower의 election timeout을 리셋시켜 분열을 막는다.
+	//
+	// election 사이클에서 false negative였던 "모든 노드 term=1" invariant가 여기선
+	// 성립한다 — leader의 첫 heartbeat이 election loop break로 RequestVote를 못 받은
+	// 노드까지도 term=1로 동기화.
+	c := newCluster(t, 3)
+	c.nodes[0].electionTimeoutTicks = 3
+	c.nodes[1].electionTimeoutTicks = 100
+	c.nodes[2].electionTimeoutTicks = 100
+	for _, n := range c.nodes {
+		n.electionElapsedTicks = 0
+	}
+	c.tickAll(3) // 노드 0이 leader가 됨
+
+	c.tickAll(50) // heartbeat이 없으면 분열 가능, 있으면 안정
+
+	leaders := 0
+	for _, n := range c.nodes {
+		if n.role == RoleLeader {
+			leaders++
+		}
+	}
+	if leaders != 1 {
+		t.Fatalf("leader should be stable after heartbeats, got %d leaders", leaders)
+	}
+	if c.nodes[0].role != RoleLeader {
+		t.Fatalf("node-0 should remain leader, got %v", c.nodes[0].role)
+	}
+	for i, n := range c.nodes {
+		if n.currentTerm != 1 {
+			t.Fatalf("node[%d] term=%d, want 1 (heartbeats sync all to leader term)", i, n.currentTerm)
+		}
+	}
+}
+
 func TestCluster_NoQuorumStaysCandidate(t *testing.T) {
 	// 노드 0만 alive, 나머지는 kill — quorum 부족. 노드 0은 candidate에 머무른다.
 	c := newCluster(t, 3)

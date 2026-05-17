@@ -22,6 +22,7 @@ func (n *Node) becomeFollower(term uint64, leader NodeID) error {
 	n.leaderID = leader
 	n.nextIndex = nil
 	n.matchIndex = nil
+	n.resetElectionTimeout() // heartbeat·grant 수신을 election cycle 시작 신호로 인식
 
 	if termChanged {
 		return n.persistHardState()
@@ -41,9 +42,11 @@ func (n *Node) becomeCandidate() error {
 	return n.persistHardState()
 }
 
-// becomeLeader는 노드를 leader로 전환하고 nextIndex/matchIndex를 초기화한다.
-// candidate 상태에서 quorum vote를 모은 직후에만 호출되어야 한다 (호출자가 보장).
-// term/votedFor는 변하지 않으므로 hardstate persist는 불필요.
+// becomeLeader는 노드를 leader로 전환하고 nextIndex/matchIndex를 초기화한 뒤
+// 즉시 첫 heartbeat를 broadcast한다 — 다음 tick까지 기다리면 그 사이 follower의
+// election timeout이 닿아 분열 가능. candidate 상태에서 quorum vote를 모은 직후에만
+// 호출되어야 한다 (호출자가 보장). term/votedFor는 변하지 않으므로 hardstate persist는
+// 불필요.
 func (n *Node) becomeLeader() {
 	n.role = RoleLeader
 	n.leaderID = n.cfg.ID
@@ -54,6 +57,8 @@ func (n *Node) becomeLeader() {
 		n.nextIndex[id] = lastIndex + 1
 		n.matchIndex[id] = 0
 	}
+	n.heartbeatElapsedTicks = 0
+	n.broadcastHeartbeatLocked()
 }
 
 // persistHardState는 현재 currentTerm/votedFor를 디스크에 영속화한다. role 전이
