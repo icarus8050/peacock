@@ -39,7 +39,7 @@
 
 ### 4.2 코드 리뷰 (`code-reviewer` sub-agent)
 
-비-trivial 변경(새 패키지, 공개 API 변경, ~50라인 이상)에서 `Agent` 툴로 호출 (`.claude/agents/code-reviewer.md`). fresh context에서 `refactor-scan`/`self-review` 체크리스트로 독립 검토.
+비-trivial 변경(새 패키지, 공개 API 변경, ~50라인 이상)에서 `Agent` 툴로 `code-reviewer` 호출 (plugin `quality-review@claude-plugins`에서 설치). fresh context에서 `refactor-scan`/`self-review` 체크리스트로 독립 검토.
 
 리뷰 결과는 우선순위(High/Med/Low)로 분류하고 채택 항목을 적용. 보류 항목은 plan 또는 후속 커밋 메모에 남긴다.
 
