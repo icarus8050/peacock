@@ -28,16 +28,6 @@ func (f *fakeTransport) SendAppendEntries(_ context.Context, to NodeID, args App
 	return f.appendReply(to, args)
 }
 
-// fakeLog은 up-to-date 비교를 위해 lastIndex/lastTerm을 통제 가능한 Log 구현.
-type fakeLog struct {
-	stubLog
-	lastIndex uint64
-	lastTerm  uint64
-}
-
-func (l fakeLog) LastIndex() uint64 { return l.lastIndex }
-func (l fakeLog) LastTerm() uint64  { return l.lastTerm }
-
 func newRaftTestNode(t *testing.T, peers []PeerInfo, tx Transport, lg Log) *Node {
 	t.Helper()
 	cfg := Config{
@@ -226,7 +216,7 @@ func TestHandleRequestVote_IdempotentGrantToSameCandidate(t *testing.T) {
 
 func TestHandleRequestVote_RejectsStaleLog(t *testing.T) {
 	// 자기 로그가 (term=3, index=5)인데 candidate는 (term=3, index=3) — index가 짧으므로 거부.
-	n := newRaftTestNode(t, nil, nil, fakeLog{lastIndex: 5, lastTerm: 3})
+	n := newRaftTestNode(t, nil, nil, seedLog(5, 3))
 
 	reply, err := n.HandleRequestVote(context.Background(), RequestVoteArgs{
 		Term: 4, CandidateID: "node-X",
@@ -249,7 +239,7 @@ func TestHandleRequestVote_RejectsStaleLog(t *testing.T) {
 
 func TestHandleRequestVote_AcceptsEqualLog(t *testing.T) {
 	// up-to-date 경계 — candidate (lastTerm, lastIndex)가 자기와 정확히 같으면 grant.
-	n := newRaftTestNode(t, nil, nil, fakeLog{lastIndex: 5, lastTerm: 3})
+	n := newRaftTestNode(t, nil, nil, seedLog(5, 3))
 
 	reply, err := n.HandleRequestVote(context.Background(), RequestVoteArgs{
 		Term: 1, CandidateID: "node-X",

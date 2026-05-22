@@ -42,23 +42,36 @@ func (n *Node) becomeCandidate() error {
 	return n.persistHardState()
 }
 
-// becomeLeader는 노드를 leader로 전환하고 nextIndex/matchIndex를 초기화한 뒤
-// 즉시 첫 heartbeat를 broadcast한다 — 다음 tick까지 기다리면 그 사이 follower의
-// election timeout이 닿아 분열 가능. candidate 상태에서 quorum vote를 모은 직후에만
-// 호출되어야 한다 (호출자가 보장). term/votedFor는 변하지 않으므로 hardstate persist는
-// 불필요.
+// becomeLeader는 노드를 leader로 전환하고, noop entry를 append한 뒤
+// nextIndex/matchIndex를 초기화하고 즉시 broadcast한다. 다음 tick까지 기다리면 그 사이
+// follower의 election timeout이 닿아 분열 가능 — 즉시 broadcast로 회피. candidate
+// 상태에서 quorum vote를 모은 직후에만 호출되어야 한다 (호출자가 보장).
+//
+// noop entry는 leader가 됐다는 사실 자체를 log에 박는다 — 논문 권장(이전 leader의
+// 미commit entry를 자기 term에서 다시 quorum 받아 commit). term/votedFor는 변하지
+// 않으므로 hardstate persist는 불필요. 호출자(gatherVotes)는 비동기 경로에서 에러를
+// 받을 수 없어 append 실패는 silent — 다음 heartbeat/RPC에서 재시도.
 func (n *Node) becomeLeader() {
 	n.role = RoleLeader
 	n.leaderID = n.cfg.ID
-	lastIndex := n.log.LastIndex()
+
+	// nextIndex는 noop append *전*의 lastIndex+1로 잡아야 첫 broadcast의 prev가
+	// follower의 lastIndex와 일치한다(happy path). noop append 후의 lastIndex로
+	// 잡으면 prev가 노op 자체를 가리키게 되어 follower가 모르는 자리 → reject.
+	preNoopLast := n.log.LastIndex()
+	_ = n.log.Append([]Entry{{
+		Term:  n.currentTerm,
+		Index: preNoopLast + 1,
+		Type:  EntryNoop,
+	}})
 	n.nextIndex = make(map[NodeID]uint64, len(n.peers))
 	n.matchIndex = make(map[NodeID]uint64, len(n.peers))
 	for id := range n.peers {
-		n.nextIndex[id] = lastIndex + 1
+		n.nextIndex[id] = preNoopLast + 1
 		n.matchIndex[id] = 0
 	}
 	n.heartbeatElapsedTicks = 0
-	n.broadcastHeartbeatLocked()
+	n.broadcastAppendEntriesLocked()
 }
 
 // persistHardState는 현재 currentTerm/votedFor를 디스크에 영속화한다. role 전이

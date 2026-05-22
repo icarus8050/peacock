@@ -15,6 +15,7 @@ type cluster struct {
 	nodes []*Node
 	ids   []NodeID
 	dirs  []string
+	logs  []*fakeLog
 	alive []bool
 }
 
@@ -28,14 +29,16 @@ func newCluster(t *testing.T, n int) *cluster {
 	peers := makeStaticPeers(ids)
 
 	dirs := make([]string, n)
+	logs := make([]*fakeLog, n)
 	nodes := make([]*Node, n)
 	alive := make([]bool, n)
 	for i := 0; i < n; i++ {
 		dirs[i] = t.TempDir()
-		nodes[i] = bootNode(t, hub, ids[i], dirs[i], peers)
+		logs[i] = newFakeLog()
+		nodes[i] = bootNode(t, hub, ids[i], dirs[i], logs[i], peers)
 		alive[i] = true
 	}
-	return &cluster{t: t, hub: hub, nodes: nodes, ids: ids, dirs: dirs, alive: alive}
+	return &cluster{t: t, hub: hub, nodes: nodes, ids: ids, dirs: dirs, logs: logs, alive: alive}
 }
 
 // tick은 한 노드를 n tick 진행시킨다. kill된 노드는 무시한다.
@@ -68,10 +71,11 @@ func (c *cluster) kill(idx int) {
 	c.alive[idx] = false
 }
 
-// restart는 같은 dir로 Node를 다시 만들어 disk의 hardstate를 복원한다.
+// restart는 같은 dir로 Node를 다시 만들어 disk의 hardstate를 복원한다. log은 같은
+// fakeLog 인스턴스를 재사용 — 메모리만 보존하지만 testing 목적엔 충분.
 func (c *cluster) restart(idx int) {
 	c.t.Helper()
-	c.nodes[idx] = bootNode(c.t, c.hub, c.ids[idx], c.dirs[idx], makeStaticPeers(c.ids))
+	c.nodes[idx] = bootNode(c.t, c.hub, c.ids[idx], c.dirs[idx], c.logs[idx], makeStaticPeers(c.ids))
 	c.alive[idx] = true
 }
 
@@ -80,7 +84,7 @@ func (c *cluster) partitionBoth(a, b NodeID) { c.hub.PartitionBoth(a, b) }
 func (c *cluster) heal(from, to NodeID)      { c.hub.Heal(from, to) }
 func (c *cluster) healBoth(a, b NodeID)      { c.hub.HealBoth(a, b) }
 
-func bootNode(t *testing.T, hub *inMemHub, id NodeID, dir string, peers []PeerInfo) *Node {
+func bootNode(t *testing.T, hub *inMemHub, id NodeID, dir string, lg Log, peers []PeerInfo) *Node {
 	t.Helper()
 	cfg := Config{
 		ID:                 id,
@@ -90,7 +94,7 @@ func bootNode(t *testing.T, hub *inMemHub, id NodeID, dir string, peers []PeerIn
 		ElectionTimeoutMin: 5 * time.Millisecond,
 		ElectionTimeoutMax: 10 * time.Millisecond,
 	}
-	node, err := NewNode(cfg, stubLog{}, stubSM{}, newInMemTransport(id, hub), peers)
+	node, err := NewNode(cfg, lg, stubSM{}, newInMemTransport(id, hub), peers)
 	if err != nil {
 		t.Fatalf("bootNode %s: %v", id, err)
 	}
@@ -210,6 +214,35 @@ func TestCluster_LeaderHeartbeatStabilizes(t *testing.T) {
 	for i, n := range c.nodes {
 		if n.currentTerm != 1 {
 			t.Fatalf("node[%d] term=%d, want 1 (heartbeats sync all to leader term)", i, n.currentTerm)
+		}
+	}
+}
+
+func TestCluster_LeaderNoopReplicatesToFollowers(t *testing.T) {
+	// becomeLeader 안에서 append하는 noop entry가 모든 follower log에 복제된다.
+	// 즉시 broadcast의 entries=[noop]가 follower에 도달 → prev=(0,0) 일치 → append.
+	// 성공 응답으로 leader의 matchIndex/nextIndex도 진전.
+	c := newCluster(t, 3)
+	c.nodes[0].electionTimeoutTicks = 3
+	c.nodes[1].electionTimeoutTicks = 100
+	c.nodes[2].electionTimeoutTicks = 100
+	for _, n := range c.nodes {
+		n.electionElapsedTicks = 0
+	}
+	c.tickAll(3) // 노드 0이 leader가 됨
+
+	for i := 0; i < 3; i++ {
+		if c.logs[i].LastIndex() != 1 {
+			t.Fatalf("node[%d] should have noop at index 1, lastIndex=%d",
+				i, c.logs[i].LastIndex())
+		}
+	}
+	for _, id := range []NodeID{"node-2", "node-3"} {
+		if c.nodes[0].matchIndex[id] != 1 {
+			t.Fatalf("leader matchIndex[%s]=%d, want 1", id, c.nodes[0].matchIndex[id])
+		}
+		if c.nodes[0].nextIndex[id] != 2 {
+			t.Fatalf("leader nextIndex[%s]=%d, want 2", id, c.nodes[0].nextIndex[id])
 		}
 	}
 }

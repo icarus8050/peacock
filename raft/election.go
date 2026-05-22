@@ -86,7 +86,7 @@ func (n *Node) requestVoteFrom(id NodeID, args RequestVoteArgs) voteOutcome {
 		return voteContinue
 	}
 	if reply.Term > n.currentTerm {
-		_ = n.becomeFollower(reply.Term, "") // persist 실패는 임시 silent — logger 도입 자리
+		_ = n.becomeFollower(reply.Term, "") // disk write 실패는 silent — 다음 RPC/timeout에서 재시도
 		return voteTerminate
 	}
 	if reply.VoteGranted {

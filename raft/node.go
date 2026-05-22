@@ -248,14 +248,15 @@ func (n *Node) onTickLocked() {
 	}
 }
 
-// onLeaderTickLocked은 leader가 매 tick마다 호출한다. heartbeatTicks 도달 시 빈
-// AppendEntries를 broadcast해 follower의 election timeout을 리셋시킨다. leader는
-// election timeout으로 step down하지 않으므로 electionElapsedTicks는 건드리지 않는다.
+// onLeaderTickLocked은 leader가 매 tick마다 호출한다. heartbeatTicks 도달 시
+// AppendEntries를 broadcast — 보낼 entries 있으면 같이, 없으면 heartbeat(빈 entries).
+// follower의 election timeout 리셋이 목적. leader는 election timeout으로 step down하지
+// 않으므로 electionElapsedTicks는 건드리지 않는다.
 func (n *Node) onLeaderTickLocked() {
 	n.heartbeatElapsedTicks++
 	if n.heartbeatElapsedTicks >= n.heartbeatTicks {
 		n.heartbeatElapsedTicks = 0
-		n.broadcastHeartbeatLocked()
+		n.broadcastAppendEntriesLocked()
 	}
 }
 

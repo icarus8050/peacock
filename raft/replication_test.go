@@ -115,7 +115,7 @@ func TestOnTick_LeaderSendsHeartbeatOnInterval(t *testing.T) {
 	}, tx, nil)
 	n.currentTerm = 1
 	n.role = RoleCandidate
-	n.becomeLeader()         // 첫 heartbeat 1회 — non-self 2개 노드에 송신 = 2
+	n.becomeLeader() // 첫 heartbeat 1회 — non-self 2개 노드에 송신 = 2
 	initial := atomic.LoadInt64(&counter)
 
 	// heartbeatTicks 만큼 tick — 다시 broadcast.
@@ -131,8 +131,206 @@ func TestOnTick_LeaderSendsHeartbeatOnInterval(t *testing.T) {
 	}
 }
 
+func TestBecomeLeader_AppendsNoopEntry(t *testing.T) {
+	// becomeLeader는 자기 term의 noop entry를 log에 박는다 — 이후 quorum AppendEntries로
+	// 이전 leader의 미commit entry까지 commit 가능해진다(논문 권장).
+	lg := newFakeLog()
+	tx := &fakeTransport{} // 응답 zero, broadcast 도중 stepdown 없음
+	n := newRaftTestNode(t, []PeerInfo{{ID: "node-1"}}, tx, lg)
+	n.currentTerm = 3
+	n.role = RoleCandidate
+
+	n.becomeLeader()
+
+	if lg.LastIndex() != 1 {
+		t.Fatalf("expected log to have noop entry at index 1, lastIndex=%d", lg.LastIndex())
+	}
+	entries, err := lg.Entries(1, 2, 0)
+	if err != nil {
+		t.Fatalf("Entries: %v", err)
+	}
+	if len(entries) != 1 || entries[0].Type != EntryNoop || entries[0].Term != 3 {
+		t.Fatalf("expected noop entry term=3, got %+v", entries)
+	}
+}
+
+func TestBuildAppendEntriesArgs_FreshFollowerGetsAllEntries(t *testing.T) {
+	// nextIndex=1인 follower는 prevLogIndex=0(log 처음 sentinel) + 모든 entries를 받는다.
+	lg := newFakeLog()
+	if err := lg.Append([]Entry{
+		{Term: 1, Index: 1, Type: EntryNoop},
+		{Term: 1, Index: 2, Type: EntryNormal, Data: []byte("x")},
+	}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	n := newRaftTestNode(t, []PeerInfo{{ID: "node-1"}, {ID: "node-2"}}, nil, lg)
+	n.currentTerm = 1
+	n.nextIndex = map[NodeID]uint64{"node-2": 1}
+
+	args, err := n.buildAppendEntriesArgs("node-2")
+	if err != nil {
+		t.Fatalf("buildAppendEntriesArgs: %v", err)
+	}
+	if args.PrevLogIndex != 0 || args.PrevLogTerm != 0 {
+		t.Fatalf("expected prev=(0,0) for fresh follower, got (%d,%d)",
+			args.PrevLogIndex, args.PrevLogTerm)
+	}
+	if len(args.Entries) != 2 {
+		t.Fatalf("expected 2 entries, got %d", len(args.Entries))
+	}
+}
+
+func TestBuildAppendEntriesArgs_CaughtUpFollowerGetsEmpty(t *testing.T) {
+	// follower가 leader log의 끝까지 따라잡았으면(nextIndex == lastIndex+1) entries=nil
+	// (heartbeat 케이스), prev는 leader log의 끝.
+	lg := newFakeLog()
+	if err := lg.Append([]Entry{
+		{Term: 1, Index: 1, Type: EntryNoop},
+		{Term: 2, Index: 2, Type: EntryNormal},
+	}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	n := newRaftTestNode(t, []PeerInfo{{ID: "node-1"}, {ID: "node-2"}}, nil, lg)
+	n.currentTerm = 2
+	n.nextIndex = map[NodeID]uint64{"node-2": 3}
+
+	args, err := n.buildAppendEntriesArgs("node-2")
+	if err != nil {
+		t.Fatalf("buildAppendEntriesArgs: %v", err)
+	}
+	if args.PrevLogIndex != 2 || args.PrevLogTerm != 2 {
+		t.Fatalf("expected prev=(2,2), got (%d,%d)", args.PrevLogIndex, args.PrevLogTerm)
+	}
+	if len(args.Entries) != 0 {
+		t.Fatalf("expected empty entries for caught-up follower, got %d", len(args.Entries))
+	}
+}
+
+func TestHandleAppendEntries_AcceptsAtEmptyLog(t *testing.T) {
+	// 빈 log에 prev=(0,0) + 첫 entry는 일치 분기 — 항상 success + append.
+	lg := newFakeLog()
+	n := newRaftTestNode(t, nil, nil, lg)
+	n.currentTerm = 1
+
+	reply, err := n.HandleAppendEntries(context.Background(), AppendEntriesArgs{
+		Term: 1, LeaderID: "node-L",
+		PrevLogIndex: 0, PrevLogTerm: 0,
+		Entries: []Entry{{Term: 1, Index: 1, Type: EntryNoop}},
+	})
+	if err != nil {
+		t.Fatalf("HandleAppendEntries: %v", err)
+	}
+	if !reply.Success {
+		t.Fatalf("expected success on empty log + prev=(0,0)")
+	}
+	if lg.LastIndex() != 1 {
+		t.Fatalf("entry should be appended, lastIndex=%d", lg.LastIndex())
+	}
+}
+
+func TestHandleAppendEntries_RejectsShortLog(t *testing.T) {
+	// follower log이 leader의 prevLogIndex보다 짧으면 일치 검사 실패 — reject.
+	lg := newFakeLog() // 빈 log (lastIndex=0)
+	n := newRaftTestNode(t, nil, nil, lg)
+	n.currentTerm = 1
+
+	reply, err := n.HandleAppendEntries(context.Background(), AppendEntriesArgs{
+		Term: 1, LeaderID: "node-L",
+		PrevLogIndex: 5, PrevLogTerm: 1, // follower엔 index 5가 없음
+		Entries: []Entry{{Term: 1, Index: 6}},
+	})
+	if err != nil {
+		t.Fatalf("HandleAppendEntries: %v", err)
+	}
+	if reply.Success {
+		t.Fatalf("expected reject — follower log too short")
+	}
+	if lg.LastIndex() != 0 {
+		t.Fatalf("nothing should be appended on prev mismatch, lastIndex=%d", lg.LastIndex())
+	}
+}
+
+func TestHandleAppendEntries_RejectsTermMismatchAtPrev(t *testing.T) {
+	// prevLogIndex 위치는 있지만 term이 다르면 reject.
+	lg := newFakeLog()
+	if err := lg.Append([]Entry{{Term: 1, Index: 1, Type: EntryNoop}}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	n := newRaftTestNode(t, nil, nil, lg)
+	n.currentTerm = 2
+
+	reply, err := n.HandleAppendEntries(context.Background(), AppendEntriesArgs{
+		Term: 2, LeaderID: "node-L",
+		PrevLogIndex: 1, PrevLogTerm: 99, // 실제 term=1과 다름
+		Entries: []Entry{{Term: 2, Index: 2}},
+	})
+	if err != nil {
+		t.Fatalf("HandleAppendEntries: %v", err)
+	}
+	if reply.Success {
+		t.Fatalf("expected reject on prev term mismatch")
+	}
+}
+
+func TestSendAppendEntries_SuccessAdvancesMatchAndNextIndex(t *testing.T) {
+	// 성공 응답 시 leader가 matchIndex/nextIndex를 진전.
+	lg := newFakeLog()
+	if err := lg.Append([]Entry{
+		{Term: 1, Index: 1, Type: EntryNoop},
+		{Term: 1, Index: 2, Type: EntryNormal},
+	}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	tx := &fakeTransport{
+		appendReply: func(_ NodeID, _ AppendEntriesArgs) (AppendEntriesReply, error) {
+			return AppendEntriesReply{Term: 1, Success: true}, nil
+		},
+	}
+	n := newRaftTestNode(t, []PeerInfo{{ID: "node-1"}, {ID: "node-2"}}, tx, lg)
+	n.currentTerm = 1
+	n.role = RoleLeader
+	n.nextIndex = map[NodeID]uint64{"node-2": 1}
+	n.matchIndex = map[NodeID]uint64{"node-2": 0}
+
+	n.sendAppendEntriesToLocked("node-2")
+
+	if n.matchIndex["node-2"] != 2 {
+		t.Fatalf("expected matchIndex=2, got %d", n.matchIndex["node-2"])
+	}
+	if n.nextIndex["node-2"] != 3 {
+		t.Fatalf("expected nextIndex=3, got %d", n.nextIndex["node-2"])
+	}
+}
+
+func TestSendAppendEntries_FailureDoesNotAdvance(t *testing.T) {
+	// 실패 응답(prev 불일치)은 Phase 2b의 conflict resolution 자리 — 지금은 silent skip,
+	// nextIndex/matchIndex 변화 없음.
+	lg := newFakeLog()
+	if err := lg.Append([]Entry{{Term: 1, Index: 1, Type: EntryNoop}}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	tx := &fakeTransport{
+		appendReply: func(_ NodeID, _ AppendEntriesArgs) (AppendEntriesReply, error) {
+			return AppendEntriesReply{Term: 1, Success: false}, nil
+		},
+	}
+	n := newRaftTestNode(t, []PeerInfo{{ID: "node-1"}, {ID: "node-2"}}, tx, lg)
+	n.currentTerm = 1
+	n.role = RoleLeader
+	n.nextIndex = map[NodeID]uint64{"node-2": 1}
+	n.matchIndex = map[NodeID]uint64{"node-2": 0}
+
+	n.sendAppendEntriesToLocked("node-2")
+
+	if n.matchIndex["node-2"] != 0 || n.nextIndex["node-2"] != 1 {
+		t.Fatalf("expected no advance on failure, got match=%d next=%d",
+			n.matchIndex["node-2"], n.nextIndex["node-2"])
+	}
+}
+
 func TestHeartbeatReply_HigherTermStepsDown(t *testing.T) {
 	// peer가 더 큰 term을 응답하면 leader가 즉시 follower로 step down.
+	// becomeLeader 안의 broadcast가 자연 트리거 — 별도 호출 안 함.
 	tx := &fakeTransport{
 		appendReply: func(_ NodeID, _ AppendEntriesArgs) (AppendEntriesReply, error) {
 			return AppendEntriesReply{Term: 99, Success: false}, nil
@@ -142,9 +340,8 @@ func TestHeartbeatReply_HigherTermStepsDown(t *testing.T) {
 		{ID: "node-1"}, {ID: "node-2"},
 	}, tx, nil)
 	n.currentTerm = 1
-	n.role = RoleLeader
-
-	n.broadcastHeartbeatLocked()
+	n.role = RoleCandidate
+	n.becomeLeader()
 
 	if n.role != RoleFollower {
 		t.Fatalf("expected stepdown to follower, got %v", n.role)
