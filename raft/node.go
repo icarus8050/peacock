@@ -188,6 +188,15 @@ func (n *Node) Stop() {
 	<-n.tickDone
 }
 
+// fatal은 회복 불가능한 disk write 실패를 받아 process를 종료한다. outbound RPC
+// 응답을 처리하다 persist/log 실패가 나면 메모리만 갱신된 채 디스크는 옛값으로 남아
+// 같은 term에 두 번 vote granted가 가능해진다(논문 fig.2 invariant 깨짐). 호출자에
+// 에러를 전파할 수 없는 비동기 경로에서만 호출하고, RPC handler처럼 응답 의무가 있는
+// 경로에선 에러를 그대로 반환한다. logger 도입 시 logger.Fatalf로 교체.
+func (n *Node) fatal(err error) {
+	panic(err)
+}
+
 // Tick은 Node의 시간을 한 단위 진행시킨다. production tick goroutine이 자동으로
 // 호출하지만, 테스트는 직접 호출해 시간을 결정적으로 제어한다.
 // 비차단 — 처리 중인 tick이 있으면 이 tick은 drop된다(과한 누적 방지, etcd 패턴).

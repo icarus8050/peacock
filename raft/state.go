@@ -49,8 +49,8 @@ func (n *Node) becomeCandidate() error {
 //
 // noop entry는 leader가 됐다는 사실 자체를 log에 박는다 — 논문 권장(이전 leader의
 // 미commit entry를 자기 term에서 다시 quorum 받아 commit). term/votedFor는 변하지
-// 않으므로 hardstate persist는 불필요. 호출자(gatherVotes)는 비동기 경로에서 에러를
-// 받을 수 없어 append 실패는 silent — 다음 heartbeat/RPC에서 재시도.
+// 않으므로 hardstate persist는 불필요. log append 실패는 disk-failure-is-fatal 정책으로
+// fatal — 호출자(gatherVotes)가 에러를 받을 수 없는 비동기 경로다.
 func (n *Node) becomeLeader() {
 	n.role = RoleLeader
 	n.leaderID = n.cfg.ID
@@ -59,11 +59,13 @@ func (n *Node) becomeLeader() {
 	// follower의 lastIndex와 일치한다(happy path). noop append 후의 lastIndex로
 	// 잡으면 prev가 노op 자체를 가리키게 되어 follower가 모르는 자리 → reject.
 	preNoopLast := n.log.LastIndex()
-	_ = n.log.Append([]Entry{{
+	if err := n.log.Append([]Entry{{
 		Term:  n.currentTerm,
 		Index: preNoopLast + 1,
 		Type:  EntryNoop,
-	}})
+	}}); err != nil {
+		n.fatal(fmt.Errorf("raft: becomeLeader: append noop: %w", err))
+	}
 	n.nextIndex = make(map[NodeID]uint64, len(n.peers))
 	n.matchIndex = make(map[NodeID]uint64, len(n.peers))
 	for id := range n.peers {

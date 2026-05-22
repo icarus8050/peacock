@@ -86,7 +86,9 @@ func (n *Node) requestVoteFrom(id NodeID, args RequestVoteArgs) voteOutcome {
 		return voteContinue
 	}
 	if reply.Term > n.currentTerm {
-		_ = n.becomeFollower(reply.Term, "") // disk write 실패는 silent — 다음 RPC/timeout에서 재시도
+		if err := n.becomeFollower(reply.Term, ""); err != nil {
+			n.fatal(fmt.Errorf("raft: stepdown on RequestVote reply: %w", err))
+		}
 		return voteTerminate
 	}
 	if reply.VoteGranted {

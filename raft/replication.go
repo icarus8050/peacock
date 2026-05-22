@@ -36,7 +36,9 @@ func (n *Node) sendAppendEntriesToLocked(id NodeID) {
 		return
 	}
 	if reply.Term > n.currentTerm {
-		_ = n.becomeFollower(reply.Term, "") // disk write 실패는 silent — 다음 heartbeat에서 재시도
+		if err := n.becomeFollower(reply.Term, ""); err != nil {
+			n.fatal(fmt.Errorf("raft: stepdown on AppendEntries reply: %w", err))
+		}
 		return
 	}
 	if !reply.Success {
