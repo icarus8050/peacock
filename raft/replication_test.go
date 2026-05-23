@@ -165,7 +165,7 @@ func TestBuildAppendEntriesArgs_FreshFollowerGetsAllEntries(t *testing.T) {
 	}
 	n := newRaftTestNode(t, []PeerInfo{{ID: "node-1"}, {ID: "node-2"}}, nil, lg)
 	n.currentTerm = 1
-	n.nextIndex = map[NodeID]uint64{"node-2": 1}
+	setLeader(t, n, "node-2")
 
 	args, err := n.buildAppendEntriesArgs("node-2")
 	if err != nil {
@@ -192,7 +192,8 @@ func TestBuildAppendEntriesArgs_CaughtUpFollowerGetsEmpty(t *testing.T) {
 	}
 	n := newRaftTestNode(t, []PeerInfo{{ID: "node-1"}, {ID: "node-2"}}, nil, lg)
 	n.currentTerm = 2
-	n.nextIndex = map[NodeID]uint64{"node-2": 3}
+	setLeader(t, n, "node-2")
+	n.nextIndex["node-2"] = 3
 
 	args, err := n.buildAppendEntriesArgs("node-2")
 	if err != nil {
@@ -288,9 +289,7 @@ func TestSendAppendEntries_SuccessAdvancesMatchAndNextIndex(t *testing.T) {
 	}
 	n := newRaftTestNode(t, []PeerInfo{{ID: "node-1"}, {ID: "node-2"}}, tx, lg)
 	n.currentTerm = 1
-	n.role = RoleLeader
-	n.nextIndex = map[NodeID]uint64{"node-2": 1}
-	n.matchIndex = map[NodeID]uint64{"node-2": 0}
+	setLeader(t, n, "node-2")
 
 	n.sendAppendEntriesToLocked("node-2")
 
@@ -302,9 +301,9 @@ func TestSendAppendEntries_SuccessAdvancesMatchAndNextIndex(t *testing.T) {
 	}
 }
 
-func TestSendAppendEntries_FailureDoesNotAdvance(t *testing.T) {
-	// 실패 응답(prev 불일치)은 Phase 2b의 conflict resolution 자리 — 지금은 silent skip,
-	// nextIndex/matchIndex 변화 없음.
+func TestSendAppendEntries_FailureClampsNextIndexAtOne(t *testing.T) {
+	// 실패 + hint 없음(zero reply) + nextIndex=1: fallback nextIndex-1 = 0 → 1로 clamp,
+	// matchIndex는 그대로. backoff의 최저 경계.
 	lg := newFakeLog()
 	if err := lg.Append([]Entry{{Term: 1, Index: 1, Type: EntryNoop}}); err != nil {
 		t.Fatalf("seed: %v", err)
@@ -316,15 +315,260 @@ func TestSendAppendEntries_FailureDoesNotAdvance(t *testing.T) {
 	}
 	n := newRaftTestNode(t, []PeerInfo{{ID: "node-1"}, {ID: "node-2"}}, tx, lg)
 	n.currentTerm = 1
-	n.role = RoleLeader
-	n.nextIndex = map[NodeID]uint64{"node-2": 1}
-	n.matchIndex = map[NodeID]uint64{"node-2": 0}
+	setLeader(t, n, "node-2")
 
 	n.sendAppendEntriesToLocked("node-2")
 
 	if n.matchIndex["node-2"] != 0 || n.nextIndex["node-2"] != 1 {
-		t.Fatalf("expected no advance on failure, got match=%d next=%d",
+		t.Fatalf("expected clamp to 1, got match=%d next=%d",
 			n.matchIndex["node-2"], n.nextIndex["node-2"])
+	}
+}
+
+func TestSendAppendEntries_FailureJumpsToConflictIndexWhenTermZero(t *testing.T) {
+	// follower log이 짧음(ConflictTerm=0). leader는 ConflictIndex로 한 번에 점프 —
+	// 단순 nextIndex-- 대비 회복 횟수를 크게 줄임.
+	lg := newFakeLog()
+	if err := lg.Append([]Entry{
+		{Term: 1, Index: 1, Type: EntryNoop},
+		{Term: 1, Index: 2, Type: EntryNormal},
+		{Term: 1, Index: 3, Type: EntryNormal},
+		{Term: 1, Index: 4, Type: EntryNormal},
+	}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	tx := &fakeTransport{
+		appendReply: func(_ NodeID, _ AppendEntriesArgs) (AppendEntriesReply, error) {
+			return AppendEntriesReply{Term: 1, Success: false, ConflictIndex: 2, ConflictTerm: 0}, nil
+		},
+	}
+	n := newRaftTestNode(t, []PeerInfo{{ID: "node-1"}, {ID: "node-2"}}, tx, lg)
+	n.currentTerm = 1
+	setLeader(t, n, "node-2")
+	n.nextIndex["node-2"] = 5
+
+	n.sendAppendEntriesToLocked("node-2")
+
+	if n.nextIndex["node-2"] != 2 {
+		t.Fatalf("expected nextIndex=2 (ConflictIndex), got %d", n.nextIndex["node-2"])
+	}
+}
+
+func TestSendAppendEntries_FailureJumpsByConflictTermWhenLeaderHasIt(t *testing.T) {
+	// follower term 충돌이지만 leader도 같은 term을 갖고 있음 — leader는 그 term의
+	// 마지막 entry+1로 점프해 일치 prefix를 최대한 보존한다.
+	lg := newFakeLog()
+	if err := lg.Append([]Entry{
+		{Term: 1, Index: 1, Type: EntryNoop},
+		{Term: 2, Index: 2, Type: EntryNormal},
+		{Term: 2, Index: 3, Type: EntryNormal},
+		{Term: 3, Index: 4, Type: EntryNormal},
+	}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	tx := &fakeTransport{
+		appendReply: func(_ NodeID, _ AppendEntriesArgs) (AppendEntriesReply, error) {
+			return AppendEntriesReply{Term: 3, Success: false, ConflictIndex: 2, ConflictTerm: 2}, nil
+		},
+	}
+	n := newRaftTestNode(t, []PeerInfo{{ID: "node-1"}, {ID: "node-2"}}, tx, lg)
+	n.currentTerm = 3
+	setLeader(t, n, "node-2")
+	n.nextIndex["node-2"] = 5
+
+	n.sendAppendEntriesToLocked("node-2")
+
+	// leader log의 term=2 마지막은 index=3 → nextIndex = 4.
+	if n.nextIndex["node-2"] != 4 {
+		t.Fatalf("expected nextIndex=4 (lastIndexOfTerm(2)+1), got %d", n.nextIndex["node-2"])
+	}
+}
+
+func TestSendAppendEntries_FailureJumpsToConflictIndexWhenTermUnknown(t *testing.T) {
+	// follower의 ConflictTerm을 leader가 모름 — leader는 ConflictIndex로 점프해 그 term
+	// 전체를 다음 RPC에서 truncate시킨다.
+	lg := newFakeLog()
+	if err := lg.Append([]Entry{
+		{Term: 1, Index: 1, Type: EntryNoop},
+		{Term: 3, Index: 2, Type: EntryNormal},
+		{Term: 3, Index: 3, Type: EntryNormal},
+	}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	tx := &fakeTransport{
+		appendReply: func(_ NodeID, _ AppendEntriesArgs) (AppendEntriesReply, error) {
+			return AppendEntriesReply{Term: 3, Success: false, ConflictIndex: 2, ConflictTerm: 2}, nil
+		},
+	}
+	n := newRaftTestNode(t, []PeerInfo{{ID: "node-1"}, {ID: "node-2"}}, tx, lg)
+	n.currentTerm = 3
+	setLeader(t, n, "node-2")
+	n.nextIndex["node-2"] = 4
+
+	n.sendAppendEntriesToLocked("node-2")
+
+	// leader에 term=2 없음 → ConflictIndex로 점프.
+	if n.nextIndex["node-2"] != 2 {
+		t.Fatalf("expected nextIndex=2 (ConflictIndex), got %d", n.nextIndex["node-2"])
+	}
+}
+
+func TestSendAppendEntries_FailureFallbackBacksOff(t *testing.T) {
+	// hint 없는 reply + nextIndex > 1: fallback이 nextIndex-1로 깎는다(MaxUint64 underflow
+	// 가드의 명시 분기 검증). underflow가 발생하면 이 테스트가 잡는다.
+	lg := newFakeLog()
+	if err := lg.Append([]Entry{
+		{Term: 1, Index: 1, Type: EntryNoop},
+		{Term: 1, Index: 2, Type: EntryNormal},
+		{Term: 1, Index: 3, Type: EntryNormal},
+	}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	tx := &fakeTransport{
+		appendReply: func(_ NodeID, _ AppendEntriesArgs) (AppendEntriesReply, error) {
+			return AppendEntriesReply{Term: 1, Success: false}, nil
+		},
+	}
+	n := newRaftTestNode(t, []PeerInfo{{ID: "node-1"}, {ID: "node-2"}}, tx, lg)
+	n.currentTerm = 1
+	setLeader(t, n, "node-2")
+	n.nextIndex["node-2"] = 3
+
+	n.sendAppendEntriesToLocked("node-2")
+
+	if n.nextIndex["node-2"] != 2 {
+		t.Fatalf("expected fallback to 2 (3-1), got %d", n.nextIndex["node-2"])
+	}
+}
+
+func TestHandleAppendEntries_ShortLogHintsLastIndexPlus1(t *testing.T) {
+	// follower log이 leader prevLogIndex보다 짧음 — ConflictTerm=0, ConflictIndex=lastIndex+1.
+	lg := newFakeLog()
+	if err := lg.Append([]Entry{{Term: 1, Index: 1, Type: EntryNoop}}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	n := newRaftTestNode(t, []PeerInfo{{ID: "node-1"}}, nil, lg)
+	n.currentTerm = 1
+
+	reply, err := n.HandleAppendEntries(context.Background(), AppendEntriesArgs{
+		Term:         1,
+		LeaderID:     "leader",
+		PrevLogIndex: 5,
+		PrevLogTerm:  1,
+	})
+	if err != nil {
+		t.Fatalf("HandleAppendEntries: %v", err)
+	}
+	if reply.Success {
+		t.Fatalf("expected reject on short log")
+	}
+	if reply.ConflictTerm != 0 || reply.ConflictIndex != 2 {
+		t.Fatalf("expected hint (idx=2, term=0), got idx=%d term=%d",
+			reply.ConflictIndex, reply.ConflictTerm)
+	}
+}
+
+func TestHandleAppendEntries_TermMismatchHintsFirstIndexOfTerm(t *testing.T) {
+	// follower의 prevLogIndex term이 leader와 다름 — ConflictTerm은 follower의 그 term,
+	// ConflictIndex는 그 term이 follower log에서 처음 나타나는 index.
+	lg := newFakeLog()
+	if err := lg.Append([]Entry{
+		{Term: 1, Index: 1, Type: EntryNoop},
+		{Term: 2, Index: 2, Type: EntryNormal},
+		{Term: 2, Index: 3, Type: EntryNormal},
+	}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	n := newRaftTestNode(t, []PeerInfo{{ID: "node-1"}}, nil, lg)
+	n.currentTerm = 3
+
+	reply, err := n.HandleAppendEntries(context.Background(), AppendEntriesArgs{
+		Term:         3,
+		LeaderID:     "leader",
+		PrevLogIndex: 3,
+		PrevLogTerm:  3,
+	})
+	if err != nil {
+		t.Fatalf("HandleAppendEntries: %v", err)
+	}
+	if reply.Success {
+		t.Fatalf("expected reject on term mismatch")
+	}
+	if reply.ConflictTerm != 2 || reply.ConflictIndex != 2 {
+		t.Fatalf("expected hint (idx=2, term=2), got idx=%d term=%d",
+			reply.ConflictIndex, reply.ConflictTerm)
+	}
+}
+
+func TestHandleAppendEntries_TruncatesConflictingEntries(t *testing.T) {
+	// follower에 leader와 충돌하는 tail entries가 있음. prev는 일치 → 그 직후부터 충돌 검사.
+	// 충돌 자리에서 TruncateAfter + leader entries로 교체.
+	lg := newFakeLog()
+	if err := lg.Append([]Entry{
+		{Term: 1, Index: 1, Type: EntryNoop},
+		{Term: 1, Index: 2, Type: EntryNormal},
+		{Term: 2, Index: 3, Type: EntryNormal}, // 충돌 — leader는 term=3 entry 보낼 예정
+		{Term: 2, Index: 4, Type: EntryNormal},
+	}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	n := newRaftTestNode(t, []PeerInfo{{ID: "node-1"}}, nil, lg)
+	n.currentTerm = 3
+
+	reply, err := n.HandleAppendEntries(context.Background(), AppendEntriesArgs{
+		Term:         3,
+		LeaderID:     "leader",
+		PrevLogIndex: 2,
+		PrevLogTerm:  1,
+		Entries: []Entry{
+			{Term: 3, Index: 3, Type: EntryNormal},
+			{Term: 3, Index: 4, Type: EntryNormal},
+		},
+	})
+	if err != nil {
+		t.Fatalf("HandleAppendEntries: %v", err)
+	}
+	if !reply.Success {
+		t.Fatalf("expected success after truncate+append")
+	}
+	if lg.LastIndex() != 4 {
+		t.Fatalf("expected lastIndex=4, got %d", lg.LastIndex())
+	}
+	if got, _ := lg.Term(3); got != 3 {
+		t.Fatalf("expected term(3)=3 (truncated+replaced), got %d", got)
+	}
+	if got, _ := lg.Term(4); got != 3 {
+		t.Fatalf("expected term(4)=3, got %d", got)
+	}
+}
+
+func TestHandleAppendEntries_IdempotentOnDuplicateBatch(t *testing.T) {
+	// leader retransmit이 두 번 도착해도 follower는 같은 (idx, term)을 두 번 append하지 않는다.
+	lg := newFakeLog()
+	if err := lg.Append([]Entry{{Term: 1, Index: 1, Type: EntryNoop}}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	n := newRaftTestNode(t, []PeerInfo{{ID: "node-1"}}, nil, lg)
+	n.currentTerm = 1
+
+	args := AppendEntriesArgs{
+		Term:         1,
+		LeaderID:     "leader",
+		PrevLogIndex: 1,
+		PrevLogTerm:  1,
+		Entries: []Entry{
+			{Term: 1, Index: 2, Type: EntryNormal},
+			{Term: 1, Index: 3, Type: EntryNormal},
+		},
+	}
+	if _, err := n.HandleAppendEntries(context.Background(), args); err != nil {
+		t.Fatalf("first: %v", err)
+	}
+	if _, err := n.HandleAppendEntries(context.Background(), args); err != nil {
+		t.Fatalf("second: %v", err)
+	}
+	if lg.LastIndex() != 3 {
+		t.Fatalf("expected lastIndex=3 after idempotent retransmit, got %d", lg.LastIndex())
 	}
 }
 

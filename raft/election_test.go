@@ -51,6 +51,21 @@ func newRaftTestNode(t *testing.T, peers []PeerInfo, tx Transport, lg Log) *Node
 	return n
 }
 
+// setLeader는 테스트가 leader 상태를 직접 박을 때의 응집 헬퍼. becomeLeader를 우회하더라도
+// leader invariant(role + leaderID + nextIndex/matchIndex non-nil)는 보존한다. nextIndex는
+// 1, matchIndex는 0으로 초기화 — 시나리오별 값은 호출 후 덮어쓴다.
+func setLeader(t *testing.T, n *Node, peers ...NodeID) {
+	t.Helper()
+	n.role = RoleLeader
+	n.leaderID = n.cfg.ID
+	n.nextIndex = make(map[NodeID]uint64, len(peers))
+	n.matchIndex = make(map[NodeID]uint64, len(peers))
+	for _, id := range peers {
+		n.nextIndex[id] = 1
+		n.matchIndex[id] = 0
+	}
+}
+
 func TestStartElection_SingleNodeBecomesLeader(t *testing.T) {
 	// 1노드 cluster — 자기 표만으로 quorum 달성, 즉시 leader.
 	n := newRaftTestNode(t, []PeerInfo{{ID: "node-1"}}, nil, nil)
@@ -103,8 +118,7 @@ func TestOnTick_LeaderDoesNotRestartElection(t *testing.T) {
 	n := newRaftTestNode(t, []PeerInfo{
 		{ID: "node-1"}, {ID: "node-2"}, {ID: "node-3"},
 	}, nil, nil)
-	n.role = RoleLeader
-	n.leaderID = n.cfg.ID
+	setLeader(t, n, "node-2", "node-3")
 	startTerm := n.currentTerm
 	n.electionElapsedTicks = 0
 	n.electionTimeoutTicks = 2
