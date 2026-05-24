@@ -68,6 +68,12 @@ type Node struct {
 	role     Role
 	leaderID NodeID
 
+	// 휘발 — commit/apply 진행도. 0에서 시작, role 전이로 리셋되지 않음. 재기동 시에도 0부터.
+	// commit/lastApplied 영속화는 논문상 휘발 OK이지만 idempotent SM 가정이 필요 — KV의
+	// put/delete는 idempotent라 안전. snapshot 도입(M2) 시 lastApplied는 snapshot index에서 시작.
+	commitIndex uint64
+	lastApplied uint64
+
 	// leader 전용 (becomeLeader에서 초기화, 아닌 경우 nil)
 	nextIndex  map[NodeID]uint64
 	matchIndex map[NodeID]uint64

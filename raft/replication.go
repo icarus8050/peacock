@@ -46,6 +46,8 @@ func (n *Node) sendAppendEntriesToLocked(id NodeID) {
 	}
 	n.matchIndex[id] = args.PrevLogIndex + uint64(len(args.Entries))
 	n.nextIndex[id] = n.matchIndex[id] + 1
+	n.maybeAdvanceCommitLocked()
+	n.applyCommittedLocked()
 }
 
 // backoffNextIndex는 reply.Success=false 시 conflict hint를 이용해 다음 시도의 nextIndex를
@@ -115,6 +117,7 @@ func (n *Node) buildAppendEntriesArgs(id NodeID) (AppendEntriesArgs, error) {
 		LeaderID:     n.cfg.ID,
 		PrevLogIndex: prevLogIndex,
 		PrevLogTerm:  prevLogTerm,
+		LeaderCommit: n.commitIndex,
 		Entries:      entries,
 	}, nil
 }
@@ -124,8 +127,7 @@ func (n *Node) buildAppendEntriesArgs(id NodeID) (AppendEntriesArgs, error) {
 //   - args.Term >= currentTerm: becomeFollower로 term/leader 갱신 + election timeout 리셋.
 //   - prev log 일치 검사 — 불일치면 conflict hint를 채워 leader가 nextIndex를 backoff하게.
 //   - 일치하면 entries 반영 — skip prefix + truncate-on-conflict + append.
-//
-// leaderCommit/commitIndex 갱신은 미구현.
+//   - LeaderCommit 반영 — min(LeaderCommit, lastNewEntry.Index)로 commitIndex 진전 후 apply.
 func (n *Node) HandleAppendEntries(ctx context.Context, args AppendEntriesArgs) (AppendEntriesReply, error) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
@@ -147,8 +149,31 @@ func (n *Node) HandleAppendEntries(ctx context.Context, args AppendEntriesArgs) 
 	if err := n.applyAppendedEntries(args.Entries); err != nil {
 		return reply, fmt.Errorf("raft: handle append: %w", err)
 	}
+	n.advanceCommitFromLeader(args)
+	n.applyCommittedLocked()
 	reply.Success = true
 	return reply, nil
+}
+
+// advanceCommitFromLeader는 follower가 args.LeaderCommit을 받아 자기 commitIndex를 진전시킨다
+// (논문 fig.2 AppendEntries receiver 5). lastNewEntry는 이 RPC가 가져온 batch의 마지막 entry,
+// 비어 있으면 prev — leader가 아직 commit 안 한 자리까지 follower가 단독 commit하지 않도록 cap.
+//
+// **stale tail 의도**: heartbeat(entries=nil)이고 follower가 자체 tail(stale leader의 미합의
+// entries)을 갖고 있더라도, cap이 args.PrevLogIndex라 그 tail은 commit하지 않는다. tail은
+// 다음 leader의 conflict resolution에서 truncate/append로 정리된다.
+func (n *Node) advanceCommitFromLeader(args AppendEntriesArgs) {
+	if args.LeaderCommit <= n.commitIndex {
+		return
+	}
+	lastNewIndex := args.PrevLogIndex + uint64(len(args.Entries))
+	next := args.LeaderCommit
+	if lastNewIndex < next {
+		next = lastNewIndex
+	}
+	if next > n.commitIndex {
+		n.commitIndex = next
+	}
 }
 
 // conflictHint는 prev log 불일치 시 leader에게 돌려주는 backoff 안내. ConflictTerm == 0은
