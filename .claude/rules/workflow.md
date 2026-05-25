@@ -33,13 +33,15 @@
 
 작업이 일단락되면 사용자 별도 지시 없이도 다음 3단계를 자동으로 수행한다.
 
-### 4.1 리팩토링 (`/refactor-scan`)
+### 4.1 자가 점검 (`/self-review` + `/refactor-scan`)
 
-변경된 패키지(또는 새 소비자 포함)를 점검 — 추상화 수준 일치, 책임 분리, 정책 비대칭, 중복 등. 채택할 항목을 그 단계에서 정리.
+변경된 패키지(또는 새 소비자 포함)를 **두 자가 스킬로 먼저** 돌린다 — `self-review`는 직전 변경분의 편집 위생(테스트의 sleep 남용, 에러 처리 일관성, gofmt 등)을, `refactor-scan`은 추상화 수준 일치·책임 분리·정책 비대칭·중복을 본다. 두 스킬은 **4.2 code-reviewer 호출보다 먼저** 자동 실행 — code-reviewer가 fresh context로 잡기 전에 자가 점검에서 위생·구조 항목을 먼저 잡아 reviewer 토큰 비용과 cycle 길이를 줄인다.
+
+채택할 항목을 이 단계에서 정리·적용. "학습 단계 trade-off"로 자가 점검 결과를 미루지 않는다 — 같은 항목이 4.2에서 다시 잡혀 cycle이 늘어진다.
 
 ### 4.2 코드 리뷰 (`code-reviewer` sub-agent)
 
-비-trivial 변경(새 패키지, 공개 API 변경, ~50라인 이상)에서 `Agent` 툴로 `code-reviewer` 호출 (plugin `quality-review@icarus8050-plugins`에서 설치). fresh context에서 `refactor-scan`/`self-review` 체크리스트로 독립 검토.
+비-trivial 변경(새 패키지, 공개 API 변경, ~50라인 이상)에서 `Agent` 툴로 `code-reviewer` 호출 (plugin `quality-review@icarus8050-plugins`에서 설치). 4.1 자가 점검을 통과한 변경분을 fresh context로 독립 검토.
 
 리뷰 결과는 우선순위(High/Med/Low)로 분류하고 채택 항목을 적용. 보류 항목은 plan 또는 후속 커밋 메모에 남긴다.
 
