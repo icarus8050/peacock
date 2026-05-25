@@ -31,6 +31,9 @@ func (n *Node) applyCommittedLocked() {
 			n.fatal(fmt.Errorf("raft: apply: sm.Apply(idx=%d): %w", next, applyErr))
 		}
 		n.lastApplied = next
+		if entry.Type == EntryNormal {
+			n.completeProposalLocked(next, nil)
+		}
 	}
 }
 

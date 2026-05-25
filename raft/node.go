@@ -78,6 +78,10 @@ type Node struct {
 	nextIndex  map[NodeID]uint64
 	matchIndex map[NodeID]uint64
 
+	// leader 전용 — Propose 호출자에게 commit+apply 결과를 통지하는 채널 맵.
+	// step-down(becomeFollower) 시 모두 ErrNotLeader로 통지하고 비운다.
+	pendingProposals map[uint64]chan proposeOutcome
+
 	// tick 단위로 정규화된 timing 파라미터 (NewNode에서 cfg.*Interval로부터 계산)
 	heartbeatTicks          int
 	electionTimeoutMinTicks int

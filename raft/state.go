@@ -22,7 +22,8 @@ func (n *Node) becomeFollower(term uint64, leader NodeID) error {
 	n.leaderID = leader
 	n.nextIndex = nil
 	n.matchIndex = nil
-	n.resetElectionTimeout() // heartbeat·grant 수신을 election cycle 시작 신호로 인식
+	n.notifyPendingProposalsLocked(ErrNotLeader) // step-down 시 대기 중인 Propose 호출자 풀어준다
+	n.resetElectionTimeout()                     // heartbeat·grant 수신을 election cycle 시작 신호로 인식
 
 	if termChanged {
 		return n.persistHardState()
@@ -74,6 +75,19 @@ func (n *Node) becomeLeader() {
 	}
 	n.heartbeatElapsedTicks = 0
 	n.broadcastAppendEntriesLocked()
+	// 1노드 cluster: noop entry가 자기 자신만으로 quorum 만족 — 즉시 commit/apply 트리거.
+	// 다중 노드면 quorumMatchIndex가 아직 부족해 no-op (첫 success 응답에서 진전).
+	n.tryCommitAndApplyLocked()
+}
+
+// tryCommitAndApplyLocked는 commit 진전을 시도하고 가능한 apply까지 한 번에 처리하는 응집
+// 헬퍼. leader가 자기 자신만으로 quorum을 만족시킬 수 있는 자리(becomeLeader의 noop,
+// Propose의 새 entry)에서 호출 — broadcast 응답을 기다리지 않고 즉시 진행한다. 다중 노드
+// 정상 경로에서는 maybeAdvanceCommit이 아직 quorum 부족으로 no-op이고, broadcast 응답
+// 처리 자리에서 다시 호출돼 진전한다.
+func (n *Node) tryCommitAndApplyLocked() {
+	n.maybeAdvanceCommitLocked()
+	n.applyCommittedLocked()
 }
 
 // persistHardState는 현재 currentTerm/votedFor를 디스크에 영속화한다. role 전이
