@@ -11,8 +11,9 @@ import (
 //
 // 자기 mu를 잡은 채 송신 — election과 같은 패턴, 노드별 mu 분리로 데드락 없음.
 //
-// context.Background()는 in-memory transport용 임시 — gRPC transport(M1-F) 도입 시
-// heartbeat interval 기반 WithTimeout으로 교체해야 한 죽은 peer가 leader를 멈추지 않는다.
+// context.Background()는 의도적 — deadline cap은 transport 어댑터 책임이다
+// (예: GRPCTransport.withTimeout이 deadline 없는 ctx에 requestTimeout을 박는다).
+// raft 코어는 transport-agnostic하게 유지.
 func (n *Node) broadcastAppendEntriesLocked() {
 	for id := range n.peers {
 		if id == n.cfg.ID {

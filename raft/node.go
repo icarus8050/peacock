@@ -198,6 +198,16 @@ func (n *Node) Stop() {
 	<-n.tickDone
 }
 
+// Role은 현재 노드의 role을 반환한다 — **테스트 진단 전용** snapshot view. production 코드가
+// role을 분기 조건으로 쓰지 말 것 — role-aware 분기가 필요하면 Propose의 ErrNotLeader 또는
+// 별도 leader-hint API로 표현한다. 이 getter로 다른 사적 상태(term, commitIndex 등)를 추가
+// 노출하지 않도록 슬리퍼리 슬로프 경계.
+func (n *Node) Role() Role {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return n.role
+}
+
 // fatal은 회복 불가능한 disk write 실패를 받아 process를 종료한다. outbound RPC
 // 응답을 처리하다 persist/log 실패가 나면 메모리만 갱신된 채 디스크는 옛값으로 남아
 // 같은 term에 두 번 vote granted가 가능해진다(논문 fig.2 invariant 깨짐). 호출자에

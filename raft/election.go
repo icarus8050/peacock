@@ -78,8 +78,9 @@ func (n *Node) gatherVotesLocked(args RequestVoteArgs) {
 // 모델에서 흔히 보는 "응답 도착 시 cycle 식별자 재검사"는 redundant. 동시성 모델을
 // 바꿀 때 그 검사가 필요해진다.
 //
-// context.Background()는 in-memory transport용 임시 — gRPC transport(M1-F) 도입 시
-// election timeout 기반 WithTimeout으로 교체해야 죽은 peer에 무한 대기하지 않는다.
+// context.Background()는 의도적 — deadline cap은 transport 어댑터 책임이다
+// (예: GRPCTransport.withTimeout이 deadline 없는 ctx에 requestTimeout을 박는다).
+// raft 코어는 transport-agnostic하게 유지하고, in-memory transport는 cap이 불필요.
 func (n *Node) requestVoteFrom(id NodeID, args RequestVoteArgs) voteOutcome {
 	reply, err := n.transport.SendRequestVote(context.Background(), id, args)
 	if err != nil {
