@@ -309,20 +309,91 @@ func (l *Log) TruncateAfter(index uint64) error {
 	return l.persistManifestLocked(l.segments)
 }
 
-// TruncateBefore는 [firstIndex, index) 범위 entry를 제거한다. M2(snapshot)에서
-// 구현한다. 현재는 호출 자체를 막지 않고 nop으로 둔다 — Open/Append 코드가 호출하지
-// 않도록 invariant로 관리.
+// TruncateBefore는 Index <= index 범위 entry를 제거한다 — snapshot 적용 후 호출되어
+// 로그가 X+1부터 시작하도록 정리한다. 호출 후 FirstIndex()는 index+1을 반환한다.
+//
+// 동작:
+//   - index == 0 / 로그가 비어 있거나 index < firstIndex: 변경 없음(idempotent).
+//   - index >= lastIndex: 모든 entry가 snapshot에 흡수되는 경우. 별도 reset API가 필요한
+//     상황으로 분류해 에러로 거절(append next-index를 재정의해야 하므로 단순 truncate로
+//     안전하지 않다).
+//   - 그 외: boundary segment(index+1 포함)를 새 seq 파일로 재작성하고 매니페스트
+//     atomic swap으로 commit. 그 앞의 prefix segments는 매니페스트 commit 이후 unlink.
+//
+// 매니페스트 갱신이 단일 commit 포인트 — 그 이전에 죽으면 새 파일은 매니페스트 밖이라
+// 무시(고아), 이후에 죽으면 옛 파일들이 매니페스트 밖이라 무시. 크래시 잔존 파일은
+// 다음 동일 op 또는 향후 GC가 제거하면 됨(현 단계는 manifest 기준이라 무해).
+//
+// **invariant — activeFile swap은 commit 전이지만 reopen 안전**:
+// 활성 boundary rewrite 시 swapActiveToLocked가 매니페스트 commit보다 먼저 실행된다.
+// commit 실패로 Log가 closed되면 디스크 매니페스트는 옛 active.seq를 가리키고 newBound
+// 파일은 매니페스트 밖이라 고아 — reopen은 옛 active 파일을 정상 active로 열고 newBound는
+// 무시한다. 옛 active 파일은 unlink가 commit 후에만 실행되므로 commit 실패 시 디스크에
+// 남아 있어 reopen 정상. 후속 작업에서 unlink 순서를 commit 전으로 옮기면 이 invariant가
+// 깨지니 주의.
 func (l *Log) TruncateBefore(index uint64) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if l.closed {
 		return ErrClosed
 	}
-	// M2에서 구현. 지금은 호출 시점에 명시적으로 알 수 있게 panic 대신 에러.
-	if index == 0 {
+
+	first := l.firstIndexLocked()
+	if index == 0 || first == 0 || index < first {
 		return nil
 	}
-	return errors.New("raftlog: TruncateBefore not implemented (M2)")
+	last := l.lastIndexLocked()
+	if index >= last {
+		return fmt.Errorf("raftlog: TruncateBefore index=%d >= lastIndex=%d (snapshot install reset required)", index, last)
+	}
+
+	boundIdx, _, ok := l.findSegmentLocked(index + 1)
+	if !ok {
+		return fmt.Errorf("raftlog: TruncateBefore boundary (index+1=%d) not found", index+1)
+	}
+	bound := l.segments[boundIdx]
+
+	// boundIdx == 0 + firstIndex > index 케이스는 위 `index < first` 가드에서 이미 처리됨
+	// (segments[0].firstIndex == firstIndexLocked()). 여기까지 도달했다면 prefix segment를
+	// 적어도 한 개 drop하거나 boundary를 rewrite하거나 둘 중 하나는 발생.
+	newBound := bound
+	if bound.firstIndex <= index {
+		mat, err := l.materializeBoundaryLocked(bound, index+1)
+		if err != nil {
+			return err
+		}
+		newBound = mat
+	}
+
+	nextSegments := append([]*segState{newBound}, l.segments[boundIdx+1:]...)
+
+	activeRewritten := newBound != bound && boundIdx == len(l.segments)-1
+	oldActivePath := ""
+	if activeRewritten {
+		oldActivePath = segmentPath(l.dir, bound.seq)
+		if err := l.swapActiveToLocked(segmentPath(l.dir, newBound.seq)); err != nil {
+			_ = os.Remove(segmentPath(l.dir, newBound.seq))
+			return err
+		}
+	}
+
+	if err := l.persistManifestLocked(nextSegments); err != nil {
+		l.closed = true
+		return err
+	}
+
+	oldSegments := l.segments
+	l.segments = nextSegments
+
+	l.unlinkSegmentsLocked(oldSegments[:boundIdx])
+	if newBound != bound {
+		oldBoundPath := oldActivePath
+		if !activeRewritten {
+			oldBoundPath = segmentPath(l.dir, bound.seq)
+		}
+		_ = os.Remove(oldBoundPath)
+	}
+	return nil
 }
 
 // Sync는 활성 segment의 buffered write를 disk에 flush + fsync한다.
@@ -516,8 +587,10 @@ func (l *Log) closeActiveForRollLocked() error {
 
 // openNextSegmentLocked는 다음 seq의 segment 파일을 새로 만들어 연다.
 // 아직 매니페스트에 등록되지 않은 고아 상태 — commit은 commitRollLocked가 수행.
+// TruncateBefore가 새 seq로 boundary를 재작성하면 maxSeq > activeSeq일 수 있으므로
+// 다음 seq는 maxSeq 기준으로 결정한다(seq 충돌 회피).
 func (l *Log) openNextSegmentLocked() (nextSegment, error) {
-	nextSeq := l.activeSeqLocked() + 1
+	nextSeq := l.maxSeqLocked() + 1
 	file, err := os.OpenFile(segmentPath(l.dir, nextSeq), os.O_CREATE|os.O_RDWR|os.O_APPEND, 0644)
 	if err != nil {
 		l.closed = true

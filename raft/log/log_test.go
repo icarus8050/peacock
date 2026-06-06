@@ -418,6 +418,263 @@ func TestSegmentRoll_PreservesContiguity(t *testing.T) {
 	}
 }
 
+func TestTruncateBefore_NopAtZero(t *testing.T) {
+	l := openLog(t, t.TempDir())
+	appendOrFatal(t, l, mkEntry(1, 1, "a"), mkEntry(2, 1, "b"))
+
+	if err := l.TruncateBefore(0); err != nil {
+		t.Fatalf("TruncateBefore(0): %v", err)
+	}
+	if got := l.FirstIndex(); got != 1 {
+		t.Fatalf("FirstIndex: got %d, want 1", got)
+	}
+	if got := l.LastIndex(); got != 2 {
+		t.Fatalf("LastIndex: got %d, want 2", got)
+	}
+}
+
+func TestTruncateBefore_NopOnEmpty(t *testing.T) {
+	l := openLog(t, t.TempDir())
+	if err := l.TruncateBefore(5); err != nil {
+		t.Fatalf("TruncateBefore on empty: %v", err)
+	}
+	if got := l.FirstIndex(); got != 0 {
+		t.Fatalf("FirstIndex after nop: got %d, want 0", got)
+	}
+}
+
+func TestTruncateBefore_NopBelowFirst(t *testing.T) {
+	// idempotent: 같은 index 두 번 호출은 두 번째가 nop이어야 한다.
+	dir := t.TempDir()
+	l := openLogWithOpts(t, Options{DirPath: dir, MaxSegmentSize: 60})
+	for i := uint64(1); i <= 6; i++ {
+		appendOrFatal(t, l, mkEntry(i, 1, fmt.Sprintf("p%d", i)))
+	}
+	if err := l.TruncateBefore(3); err != nil {
+		t.Fatalf("first TruncateBefore(3): %v", err)
+	}
+	wantFirst := l.FirstIndex()
+	if err := l.TruncateBefore(2); err != nil {
+		t.Fatalf("second TruncateBefore(2): %v", err)
+	}
+	if got := l.FirstIndex(); got != wantFirst {
+		t.Fatalf("idempotent call moved FirstIndex: got %d, want %d", got, wantFirst)
+	}
+}
+
+func TestTruncateBefore_RejectsDropAll(t *testing.T) {
+	l := openLog(t, t.TempDir())
+	appendOrFatal(t, l, mkEntry(1, 1, "a"), mkEntry(2, 1, "b"))
+
+	err := l.TruncateBefore(2)
+	if err == nil {
+		t.Fatal("TruncateBefore(>=lastIndex) should error (snapshot reset path)")
+	}
+}
+
+func TestTruncateBefore_AtSegmentBoundary(t *testing.T) {
+	// boundary가 sealed segment의 lastIndex와 정확히 일치 — rewrite 없이 prefix drop만.
+	dir := t.TempDir()
+	l := openLogWithOpts(t, Options{DirPath: dir, MaxSegmentSize: 60})
+	for i := uint64(1); i <= 6; i++ {
+		appendOrFatal(t, l, mkEntry(i, 1, fmt.Sprintf("p%d", i)))
+	}
+	if err := l.Sync(); err != nil {
+		t.Fatalf("sync: %v", err)
+	}
+	if len(l.segments) < 3 {
+		t.Fatalf("setup expected 3+ segments, got %d", len(l.segments))
+	}
+
+	cutIdx := l.segments[0].lastIndex
+	if err := l.TruncateBefore(cutIdx); err != nil {
+		t.Fatalf("TruncateBefore(%d): %v", cutIdx, err)
+	}
+	if got := l.FirstIndex(); got != cutIdx+1 {
+		t.Fatalf("FirstIndex after boundary truncate: got %d, want %d", got, cutIdx+1)
+	}
+
+	// 옛 segment 파일이 디스크에서 사라졌는지 확인 — manifest commit 후 unlink.
+	// (boundary == sealed[0].lastIndex이므로 sealed[0]는 통째로 drop.)
+	files, err := filepath.Glob(filepath.Join(dir, "log-*.seg"))
+	if err != nil {
+		t.Fatalf("glob: %v", err)
+	}
+	if len(files) != len(l.segments) {
+		t.Fatalf("disk has %d log files, manifest has %d segments", len(files), len(l.segments))
+	}
+}
+
+func TestTruncateBefore_MidSealedSegment(t *testing.T) {
+	// boundary가 sealed segment 중간 — 그 segment는 새 seq로 rewrite되고 옛 파일은 unlink.
+	// MaxSegmentSize=100으로 entry당 ~31B 기준 segment당 3 entry를 묶는다.
+	dir := t.TempDir()
+	l := openLogWithOpts(t, Options{DirPath: dir, MaxSegmentSize: 100})
+	for i := uint64(1); i <= 9; i++ {
+		appendOrFatal(t, l, mkEntry(i, 1, fmt.Sprintf("p%d", i)))
+	}
+	if err := l.Sync(); err != nil {
+		t.Fatalf("sync: %v", err)
+	}
+	if len(l.segments) < 3 {
+		t.Fatalf("setup expected 3+ segments, got %d", len(l.segments))
+	}
+
+	// sealed[1] 중간 — firstIndex < cut < lastIndex.
+	target := l.segments[1]
+	if target.lastIndex-target.firstIndex < 2 {
+		t.Fatalf("sealed[1] too small (first=%d last=%d)", target.firstIndex, target.lastIndex)
+	}
+	cutIdx := target.firstIndex // 첫 entry까지 drop, 그 다음부터 남김
+
+	if err := l.TruncateBefore(cutIdx); err != nil {
+		t.Fatalf("TruncateBefore(%d): %v", cutIdx, err)
+	}
+	if got := l.FirstIndex(); got != cutIdx+1 {
+		t.Fatalf("FirstIndex: got %d, want %d", got, cutIdx+1)
+	}
+
+	// 남은 entries는 정상 read 가능
+	es, err := l.Entries(cutIdx+1, l.LastIndex()+1, 0)
+	if err != nil {
+		t.Fatalf("entries: %v", err)
+	}
+	for i, e := range es {
+		wantIdx := cutIdx + 1 + uint64(i)
+		if e.Index != wantIdx {
+			t.Fatalf("entries[%d].Index: got %d, want %d", i, e.Index, wantIdx)
+		}
+	}
+
+	// 디스크 고아 없음 — manifest count == 디스크 log 파일 count.
+	files, err := filepath.Glob(filepath.Join(dir, "log-*.seg"))
+	if err != nil {
+		t.Fatalf("glob: %v", err)
+	}
+	if len(files) != len(l.segments) {
+		t.Fatalf("orphan files: disk=%d manifest=%d", len(files), len(l.segments))
+	}
+}
+
+func TestTruncateBefore_MidActiveSegment(t *testing.T) {
+	// boundary가 활성 segment 중간 — rewrite + activeFile swap.
+	dir := t.TempDir()
+	l := openLogWithOpts(t, Options{DirPath: dir, MaxSegmentSize: 100})
+	for i := uint64(1); i <= 9; i++ {
+		appendOrFatal(t, l, mkEntry(i, 1, fmt.Sprintf("p%d", i)))
+	}
+	if err := l.Sync(); err != nil {
+		t.Fatalf("sync: %v", err)
+	}
+	active := l.segments[len(l.segments)-1]
+	if active.lastIndex-active.firstIndex < 1 {
+		t.Fatalf("active segment too small to test mid-cut (first=%d last=%d)",
+			active.firstIndex, active.lastIndex)
+	}
+	cutIdx := active.firstIndex // active의 첫 entry까지 drop
+
+	if err := l.TruncateBefore(cutIdx); err != nil {
+		t.Fatalf("TruncateBefore(%d): %v", cutIdx, err)
+	}
+	if got := l.FirstIndex(); got != cutIdx+1 {
+		t.Fatalf("FirstIndex: got %d, want %d", got, cutIdx+1)
+	}
+
+	// rewrite 후에도 추가 Append가 정상 동작 — LastIndex+1부터 받아야 한다.
+	nextIdx := l.LastIndex() + 1
+	appendOrFatal(t, l, mkEntry(nextIdx, 1, "after"))
+	if got := l.LastIndex(); got != nextIdx {
+		t.Fatalf("LastIndex after Append: got %d, want %d", got, nextIdx)
+	}
+}
+
+func TestTruncateBefore_ReopenPreserves(t *testing.T) {
+	// truncate 후 close + reopen — 매니페스트와 disk가 일치해 정상 복원되는지.
+	dir := t.TempDir()
+	l := openLogWithOpts(t, Options{DirPath: dir, MaxSegmentSize: 60})
+	for i := uint64(1); i <= 7; i++ {
+		appendOrFatal(t, l, mkEntry(i, 1, fmt.Sprintf("p%d", i)))
+	}
+	if err := l.Sync(); err != nil {
+		t.Fatalf("sync: %v", err)
+	}
+	if err := l.TruncateBefore(3); err != nil {
+		t.Fatalf("TruncateBefore: %v", err)
+	}
+	wantFirst := l.FirstIndex()
+	wantLast := l.LastIndex()
+	if err := l.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	l2 := openLog(t, dir)
+	if got := l2.FirstIndex(); got != wantFirst {
+		t.Fatalf("reopen FirstIndex: got %d, want %d", got, wantFirst)
+	}
+	if got := l2.LastIndex(); got != wantLast {
+		t.Fatalf("reopen LastIndex: got %d, want %d", got, wantLast)
+	}
+	es, err := l2.Entries(wantFirst, wantLast+1, 0)
+	if err != nil {
+		t.Fatalf("entries: %v", err)
+	}
+	for i, e := range es {
+		wantIdx := wantFirst + uint64(i)
+		wantData := fmt.Sprintf("p%d", wantIdx)
+		if e.Index != wantIdx || !bytes.Equal(e.Data, []byte(wantData)) {
+			t.Fatalf("entries[%d]: got idx=%d data=%q, want idx=%d data=%q",
+				i, e.Index, e.Data, wantIdx, wantData)
+		}
+	}
+}
+
+func TestTruncateBefore_RollUsesMaxSeqPlusOne(t *testing.T) {
+	// boundary rewrite로 maxSeq > activeSeq가 된 후 roll이 발생하면 새 seq는
+	// maxSeq+1이어야 한다 (activeSeq+1로 계산하면 기존 boundary 파일과 충돌). 회귀 가드.
+	dir := t.TempDir()
+	l := openLogWithOpts(t, Options{DirPath: dir, MaxSegmentSize: 100})
+	for i := uint64(1); i <= 9; i++ {
+		appendOrFatal(t, l, mkEntry(i, 1, fmt.Sprintf("p%d", i)))
+	}
+	if err := l.Sync(); err != nil {
+		t.Fatalf("sync: %v", err)
+	}
+	if len(l.segments) < 3 {
+		t.Fatalf("setup expected 3+ segments, got %d", len(l.segments))
+	}
+	target := l.segments[1]
+	cutIdx := target.firstIndex
+	if err := l.TruncateBefore(cutIdx); err != nil {
+		t.Fatalf("TruncateBefore: %v", err)
+	}
+
+	maxBefore := l.maxSeqLocked()
+
+	// roll 유발: 활성 segment를 더 채워 새 segment 생성을 강제 (LastIndex+1부터 N개 고정).
+	start := l.LastIndex() + 1
+	for i := start; i < start+12; i++ {
+		appendOrFatal(t, l, mkEntry(i, 1, fmt.Sprintf("q%d", i)))
+	}
+	if err := l.Sync(); err != nil {
+		t.Fatalf("sync: %v", err)
+	}
+
+	// 디스크 고아 없음 — manifest와 disk 파일 1:1.
+	files, err := filepath.Glob(filepath.Join(dir, "log-*.seg"))
+	if err != nil {
+		t.Fatalf("glob: %v", err)
+	}
+	if len(files) != len(l.segments) {
+		t.Fatalf("orphan files: disk=%d manifest=%d", len(files), len(l.segments))
+	}
+	// 가장 최근 활성 segment의 seq는 maxBefore를 초과해야 한다. 회귀(activeSeq+1)면
+	// 새 seq ≤ maxBefore가 되어 fail. roll이 실제 일어났는지도 동시에 검증한다.
+	lastSegSeq := l.segments[len(l.segments)-1].seq
+	if lastSegSeq <= maxBefore {
+		t.Fatalf("active seq=%d should exceed maxBefore=%d (roll missing or seq collision)", lastSegSeq, maxBefore)
+	}
+}
+
 func indexes(es []Entry) []uint64 {
 	out := make([]uint64, len(es))
 	for i, e := range es {
