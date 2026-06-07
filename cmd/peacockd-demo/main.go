@@ -15,7 +15,9 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"flag"
 	"fmt"
@@ -64,11 +66,12 @@ func main() {
 }
 
 type cliOptions struct {
-	id       string
-	raftAddr string
-	httpAddr string
-	dir      string
-	peers    []raft.PeerInfo
+	id                string
+	raftAddr          string
+	httpAddr          string
+	dir               string
+	peers             []raft.PeerInfo
+	snapshotThreshold uint64
 }
 
 func parseFlags() cliOptions {
@@ -78,6 +81,7 @@ func parseFlags() cliOptions {
 		httpAddr  = flag.String("http-addr", "", "HTTP listen address for propose/status API (e.g. 127.0.0.1:5001)")
 		dir       = flag.String("dir", "", "directory for raft log and hardstate")
 		peersFlag = flag.String("peers", "", "comma-separated id=addr list (self 포함)")
+		snapThr   = flag.Uint64("snapshot-threshold", 0, "snapshot 후 미적용 entry 임계 (0=비활성)")
 	)
 	flag.Parse()
 
@@ -92,11 +96,12 @@ func parseFlags() cliOptions {
 		os.Exit(2)
 	}
 	return cliOptions{
-		id:       *id,
-		raftAddr: *raftAddr,
-		httpAddr: *httpAddr,
-		dir:      *dir,
-		peers:    peers,
+		id:                *id,
+		raftAddr:          *raftAddr,
+		httpAddr:          *httpAddr,
+		dir:               *dir,
+		peers:             peers,
+		snapshotThreshold: *snapThr,
 	}
 }
 
@@ -127,11 +132,12 @@ func parsePeers(s string) ([]raft.PeerInfo, error) {
 func bootNode(opts cliOptions) (*node.Node, *demoSM, error) {
 	sm := &demoSM{}
 	nd, err := node.New(node.Options{
-		ID:       raft.NodeID(opts.id),
-		RaftAddr: opts.raftAddr,
-		RaftDir:  opts.dir,
-		Peers:    opts.peers,
-		SM:       sm,
+		ID:         raft.NodeID(opts.id),
+		RaftAddr:   opts.raftAddr,
+		RaftDir:    opts.dir,
+		Peers:      opts.peers,
+		SM:         sm,
+		RaftConfig: raft.Config{SnapshotThreshold: opts.snapshotThreshold},
 	})
 	if err != nil {
 		return nil, nil, fmt.Errorf("node.New: %w", err)
@@ -153,12 +159,20 @@ func (s *demoSM) Apply(e raft.Entry) (any, error) {
 	return nil, nil
 }
 
-// Snapshot/Restore는 M2 자리. M1 데모는 snapshot threshold에 닿지 않는다.
+// Snapshot/Restore는 카운터를 8바이트로 직렬화/복원한다 — demoSM의 전체 상태가
+// normalApplied 하나뿐이라 충분.
 func (s *demoSM) Snapshot() (io.ReadCloser, error) {
-	return nil, errors.New("snapshot: not implemented in M1 demo")
+	var buf [8]byte
+	binary.LittleEndian.PutUint64(buf[:], uint64(s.normalApplied.Load()))
+	return io.NopCloser(bytes.NewReader(buf[:])), nil
 }
-func (s *demoSM) Restore(io.Reader) error {
-	return errors.New("restore: not implemented in M1 demo")
+func (s *demoSM) Restore(r io.Reader) error {
+	var buf [8]byte
+	if _, err := io.ReadFull(r, buf[:]); err != nil {
+		return fmt.Errorf("demo restore: %w", err)
+	}
+	s.normalApplied.Store(int64(binary.LittleEndian.Uint64(buf[:])))
+	return nil
 }
 
 func startProposeAPI(addr string, nd *node.Node, sm *demoSM) *http.Server {

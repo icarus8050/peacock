@@ -94,7 +94,7 @@ func bootNode(t *testing.T, hub *inMemHub, id NodeID, dir string, lg Log, peers 
 		ElectionTimeoutMin: 5 * time.Millisecond,
 		ElectionTimeoutMax: 10 * time.Millisecond,
 	}
-	node, err := NewNode(cfg, lg, stubSM{}, newInMemTransport(id, hub), peers)
+	node, err := NewNode(cfg, lg, stubSM{}, newMemSnap(), newInMemTransport(id, hub), peers)
 	if err != nil {
 		t.Fatalf("bootNode %s: %v", id, err)
 	}

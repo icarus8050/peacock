@@ -23,6 +23,7 @@ type Config struct {
 	ElectionTimeoutMin time.Duration
 	ElectionTimeoutMax time.Duration
 	MaxAppendEntries   int
+	SnapshotThreshold  uint64 // 미적용 entry 수가 이 값 이상이면 snapshot. 0 = 비활성.
 	Dir                string // hardstate 영속 디렉터리
 }
 
@@ -57,6 +58,7 @@ type Node struct {
 	cfg       Config
 	log       Log
 	sm        StateMachine
+	snap      SnapshotStore
 	transport Transport
 	peers     map[NodeID]PeerInfo
 
@@ -105,7 +107,9 @@ type Node struct {
 // NewNode는 Config + 의존성으로 새 Node를 만든다. 시작은 별도 Start 호출.
 // peers는 자기 자신을 포함한 정적 멤버 목록.
 // hardstate가 디렉터리에 있으면 그 term/votedFor로 복원되고, 없으면 zero에서 시작.
-func NewNode(cfg Config, lg Log, sm StateMachine, t Transport, peers []PeerInfo) (*Node, error) {
+// snap에 저장된 snapshot이 있으면 SM.Restore로 상태를 복원하고 lastApplied/commitIndex를
+// snapshot index로 끌어올린다.
+func NewNode(cfg Config, lg Log, sm StateMachine, snap SnapshotStore, t Transport, peers []PeerInfo) (*Node, error) {
 	cfg = cfg.withDefaults()
 	if cfg.ID == "" {
 		return nil, fmt.Errorf("raft: NewNode: ID is empty")
@@ -118,6 +122,9 @@ func NewNode(cfg Config, lg Log, sm StateMachine, t Transport, peers []PeerInfo)
 	}
 	if sm == nil {
 		return nil, fmt.Errorf("raft: NewNode: StateMachine is nil")
+	}
+	if snap == nil {
+		return nil, fmt.Errorf("raft: NewNode: SnapshotStore is nil")
 	}
 	if t == nil {
 		return nil, fmt.Errorf("raft: NewNode: Transport is nil")
@@ -154,6 +161,7 @@ func NewNode(cfg Config, lg Log, sm StateMachine, t Transport, peers []PeerInfo)
 		cfg:                     cfg,
 		log:                     lg,
 		sm:                      sm,
+		snap:                    snap,
 		transport:               t,
 		peers:                   peerMap,
 		currentTerm:             hs.Term,
@@ -168,8 +176,31 @@ func NewNode(cfg Config, lg Log, sm StateMachine, t Transport, peers []PeerInfo)
 		runDone:                 make(chan struct{}),
 		tickDone:                make(chan struct{}),
 	}
+	if err := n.restoreFromSnapshot(); err != nil {
+		return nil, err
+	}
 	n.resetElectionTimeout()
 	return n, nil
+}
+
+// restoreFromSnapshot은 저장된 snapshot이 있으면 SM에 복원하고 commit/apply 진행도를
+// snapshot index로 끌어올린다 — snapshot에 흡수된 entry는 이미 적용된 것이므로 로그
+// 재생은 snapshot index 다음부터 시작해야 한다. snapshot이 없으면 zero에서 시작.
+func (n *Node) restoreFromSnapshot() error {
+	meta, rc, err := n.snap.Latest()
+	if errors.Is(err, ErrNoSnapshot) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("raft: restore: load snapshot: %w", err)
+	}
+	defer rc.Close()
+	if err := n.sm.Restore(rc); err != nil {
+		return fmt.Errorf("raft: restore: sm.Restore: %w", err)
+	}
+	n.lastApplied = meta.Index
+	n.commitIndex = meta.Index
+	return nil
 }
 
 // asTicks는 Duration이 TickInterval의 양의 정수배임을 검증하고 tick 수로 변환한다.

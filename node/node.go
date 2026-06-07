@@ -3,9 +3,11 @@ package node
 import (
 	"fmt"
 	"net"
+	"path/filepath"
 
 	"peacock/raft"
 	raftlog "peacock/raft/log"
+	raftsnap "peacock/raft/snapshot"
 	"peacock/transport"
 )
 
@@ -47,6 +49,13 @@ func New(opts Options) (*Node, error) {
 		return nil, fmt.Errorf("node: open raft log: %w", err)
 	}
 
+	snap, err := raftsnap.Open(filepath.Join(opts.RaftDir, "snap"))
+	if err != nil {
+		_ = lg.Close()
+		_ = lis.Close()
+		return nil, fmt.Errorf("node: open snapshot store: %w", err)
+	}
+
 	tr := transport.NewGRPCTransport(opts.Dialer, opts.RequestTimeout)
 	for _, p := range opts.Peers {
 		if p.ID == opts.ID {
@@ -59,7 +68,7 @@ func New(opts Options) (*Node, error) {
 	cfg.ID = opts.ID
 	cfg.Dir = opts.RaftDir
 
-	rn, err := raft.NewNode(cfg, lg, opts.SM, tr, opts.Peers)
+	rn, err := raft.NewNode(cfg, lg, opts.SM, snap, tr, opts.Peers)
 	if err != nil {
 		_ = lg.Close()
 		tr.Close()

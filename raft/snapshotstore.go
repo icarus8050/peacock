@@ -32,4 +32,7 @@ type SnapshotStore interface {
 	LatestMeta() (meta SnapshotMeta, ok bool, err error)
 }
 
+// ErrNoSnapshot은 저장된 snapshot이 없을 때 Latest가 반환한다(raftsnap 재노출).
+var ErrNoSnapshot = raftsnap.ErrNoSnapshot
+
 var _ SnapshotStore = (*raftsnap.Store)(nil)

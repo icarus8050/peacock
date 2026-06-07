@@ -35,6 +35,7 @@ func (n *Node) applyCommittedLocked() {
 			n.completeProposalLocked(next, nil)
 		}
 	}
+	n.maybeSnapshotLocked()
 }
 
 // entryAt은 정확히 index 한 자리의 entry를 가져온다. log.Entries [lo, hi) 반열림 구간이라

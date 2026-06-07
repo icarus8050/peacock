@@ -49,7 +49,7 @@ func newTestNode(t *testing.T) *Node {
 		ElectionTimeoutMax: 10 * time.Millisecond,
 		Dir:                dir,
 	}
-	n, err := NewNode(cfg, stubLog{}, stubSM{}, stubTransport{}, []PeerInfo{
+	n, err := NewNode(cfg, stubLog{}, stubSM{}, newMemSnap(), stubTransport{}, []PeerInfo{
 		{ID: "node-1", Addr: ":1"},
 		{ID: "node-2", Addr: ":2"},
 		{ID: "node-3", Addr: ":3"},
@@ -72,7 +72,7 @@ func TestNewNode_RequiredFields(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			cfg := Config{ID: "n1", Dir: t.TempDir()}
 			tc.mut(&cfg)
-			_, err := NewNode(cfg, stubLog{}, stubSM{}, stubTransport{}, nil)
+			_, err := NewNode(cfg, stubLog{}, stubSM{}, newMemSnap(), stubTransport{}, nil)
 			if err == nil {
 				t.Fatalf("expected error, got nil")
 			}
@@ -89,7 +89,7 @@ func TestNewNode_RejectsNonMultipleInterval(t *testing.T) {
 		ElectionTimeoutMin: 50 * time.Millisecond,
 		ElectionTimeoutMax: 100 * time.Millisecond,
 	}
-	_, err := NewNode(cfg, stubLog{}, stubSM{}, stubTransport{}, nil)
+	_, err := NewNode(cfg, stubLog{}, stubSM{}, newMemSnap(), stubTransport{}, nil)
 	if err == nil {
 		t.Fatalf("expected error for non-multiple HeartbeatInterval, got nil")
 	}
@@ -104,7 +104,7 @@ func TestNewNode_RejectsMaxLessThanMin(t *testing.T) {
 		ElectionTimeoutMin: 100 * time.Millisecond,
 		ElectionTimeoutMax: 50 * time.Millisecond, // < min
 	}
-	_, err := NewNode(cfg, stubLog{}, stubSM{}, stubTransport{}, nil)
+	_, err := NewNode(cfg, stubLog{}, stubSM{}, newMemSnap(), stubTransport{}, nil)
 	if err == nil {
 		t.Fatalf("expected error for ElectionTimeoutMax < Min, got nil")
 	}
@@ -117,7 +117,7 @@ func TestNewNode_RestoresHardState(t *testing.T) {
 	}
 
 	cfg := Config{ID: "node-1", Dir: dir}
-	n, err := NewNode(cfg, stubLog{}, stubSM{}, stubTransport{}, nil)
+	n, err := NewNode(cfg, stubLog{}, stubSM{}, newMemSnap(), stubTransport{}, nil)
 	if err != nil {
 		t.Fatalf("NewNode: %v", err)
 	}

@@ -44,7 +44,7 @@ func newRaftTestNode(t *testing.T, peers []PeerInfo, tx Transport, lg Log) *Node
 	if tx == nil {
 		tx = &fakeTransport{}
 	}
-	n, err := NewNode(cfg, lg, stubSM{}, tx, peers)
+	n, err := NewNode(cfg, lg, stubSM{}, newMemSnap(), tx, peers)
 	if err != nil {
 		t.Fatalf("NewNode: %v", err)
 	}
