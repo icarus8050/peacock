@@ -675,6 +675,149 @@ func TestTruncateBefore_RollUsesMaxSeqPlusOne(t *testing.T) {
 	}
 }
 
+func TestTruncateBefore_PreservesBoundaryTerm(t *testing.T) {
+	// 압축 후에도 Term(snapshotIndex)는 폐기 전 term을 답해야 한다(replication prevLogTerm).
+	l := openLog(t, t.TempDir())
+	// term이 자리마다 다르게: idx 1~3 term1, 4~6 term2.
+	for i := uint64(1); i <= 6; i++ {
+		term := uint64(1)
+		if i >= 4 {
+			term = 2
+		}
+		appendOrFatal(t, l, mkEntry(i, term, fmt.Sprintf("p%d", i)))
+	}
+	if err := l.Sync(); err != nil {
+		t.Fatalf("sync: %v", err)
+	}
+
+	if err := l.TruncateBefore(4); err != nil {
+		t.Fatalf("TruncateBefore(4): %v", err)
+	}
+	if got := l.FirstIndex(); got != 5 {
+		t.Fatalf("FirstIndex: got %d, want 5", got)
+	}
+	got, err := l.Term(4) // 경계 entry — 사라졌지만 term은 보존
+	if err != nil {
+		t.Fatalf("Term(4): %v", err)
+	}
+	if got != 2 {
+		t.Fatalf("boundary Term(4): got %d, want 2", got)
+	}
+	if _, err := l.Term(3); !errors.Is(err, ErrOutOfRange) {
+		t.Fatalf("Term(3) below boundary: want ErrOutOfRange, got %v", err)
+	}
+}
+
+func TestTruncateBefore_BoundaryTermSurvivesReopen(t *testing.T) {
+	// manifest v2가 경계 term을 영속하는지 — reopen 후 Term(snapshotIndex) 유지.
+	// 경계 term(5)을 이웃 term(2)과 다르게 둬 "아무 term이나 통과"를 배제한다.
+	dir := t.TempDir()
+	l := openLog(t, dir)
+	for i := uint64(1); i <= 6; i++ {
+		term := uint64(2)
+		if i >= 4 {
+			term = 5
+		}
+		appendOrFatal(t, l, mkEntry(i, term, fmt.Sprintf("p%d", i)))
+	}
+	if err := l.Sync(); err != nil {
+		t.Fatalf("sync: %v", err)
+	}
+	if err := l.TruncateBefore(4); err != nil {
+		t.Fatalf("TruncateBefore: %v", err)
+	}
+	if err := l.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	l2 := openLog(t, dir)
+	if got := l2.FirstIndex(); got != 5 {
+		t.Fatalf("reopen FirstIndex: got %d, want 5", got)
+	}
+	got, err := l2.Term(4)
+	if err != nil {
+		t.Fatalf("reopen Term(4): %v", err)
+	}
+	if got != 5 {
+		t.Fatalf("reopen boundary Term(4): got %d, want 5", got)
+	}
+}
+
+func TestReset_EmptiesAndSetsBoundary(t *testing.T) {
+	l := openLog(t, t.TempDir())
+	for i := uint64(1); i <= 5; i++ {
+		appendOrFatal(t, l, mkEntry(i, 1, fmt.Sprintf("p%d", i)))
+	}
+	if err := l.Sync(); err != nil {
+		t.Fatalf("sync: %v", err)
+	}
+
+	if err := l.Reset(20, 7); err != nil {
+		t.Fatalf("Reset(20,7): %v", err)
+	}
+	if got := l.FirstIndex(); got != 21 {
+		t.Fatalf("FirstIndex: got %d, want 21", got)
+	}
+	if got := l.LastIndex(); got != 20 {
+		t.Fatalf("LastIndex: got %d, want 20", got)
+	}
+	if got := l.LastTerm(); got != 7 {
+		t.Fatalf("LastTerm: got %d, want 7", got)
+	}
+	got, err := l.Term(20)
+	if err != nil {
+		t.Fatalf("Term(20): %v", err)
+	}
+	if got != 7 {
+		t.Fatalf("boundary Term(20): got %d, want 7", got)
+	}
+	if _, err := l.Entries(1, 6, 0); !errors.Is(err, ErrOutOfRange) {
+		t.Fatalf("Entries below boundary: want ErrOutOfRange, got %v", err)
+	}
+
+	// 다음 Append는 boundary+1(21)로 이어지고 term 단조성은 boundary term(7) 기준.
+	if err := l.Append([]Entry{mkEntry(21, 6, "x")}); !errors.Is(err, ErrAppendBadTerm) {
+		t.Fatalf("Append term<boundary: want ErrAppendBadTerm, got %v", err)
+	}
+	appendOrFatal(t, l, mkEntry(21, 7, "after"))
+	if got := l.LastIndex(); got != 21 {
+		t.Fatalf("LastIndex after Append: got %d, want 21", got)
+	}
+}
+
+func TestReset_ReopenPreservesBoundary(t *testing.T) {
+	dir := t.TempDir()
+	l := openLog(t, dir)
+	for i := uint64(1); i <= 5; i++ {
+		appendOrFatal(t, l, mkEntry(i, 1, fmt.Sprintf("p%d", i)))
+	}
+	if err := l.Sync(); err != nil {
+		t.Fatalf("sync: %v", err)
+	}
+	if err := l.Reset(30, 9); err != nil {
+		t.Fatalf("Reset: %v", err)
+	}
+	appendOrFatal(t, l, mkEntry(31, 9, "after"))
+	if err := l.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	l2 := openLog(t, dir)
+	if got := l2.FirstIndex(); got != 31 {
+		t.Fatalf("reopen FirstIndex: got %d, want 31", got)
+	}
+	if got := l2.LastIndex(); got != 31 {
+		t.Fatalf("reopen LastIndex: got %d, want 31", got)
+	}
+	got, err := l2.Term(30)
+	if err != nil {
+		t.Fatalf("reopen Term(30): %v", err)
+	}
+	if got != 9 {
+		t.Fatalf("reopen boundary Term(30): got %d, want 9", got)
+	}
+}
+
 func indexes(es []Entry) []uint64 {
 	out := make([]uint64, len(es))
 	for i, e := range es {

@@ -31,9 +31,13 @@ type Log interface {
 	// conflicting entries를 잘라낼 때 쓴다.
 	TruncateAfter(index uint64) error
 
-	// TruncateBefore는 [firstIndex, index) 범위 entry를 제거.
-	// snapshot 적용 후 prefix 압축에 쓴다.
+	// TruncateBefore는 Index <= index 범위 entry를 제거하고 압축 경계를 index로 옮긴다.
+	// snapshot 적용 후 prefix 압축에 쓴다. 이후 Term(index)는 snapshot term을 답한다.
 	TruncateBefore(index uint64) error
+
+	// Reset은 모든 entry를 폐기하고 로그를 경계 (index, term)에서 다시 시작시킨다.
+	// snapshot이 로그 전체를 흡수하거나 InstallSnapshot으로 로그를 갈아끼울 때 쓴다.
+	Reset(index, term uint64) error
 
 	// Sync는 buffered write를 디스크에 flush + fsync.
 	Sync() error

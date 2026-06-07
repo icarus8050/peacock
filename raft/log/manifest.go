@@ -16,13 +16,15 @@ const (
 	manifestTmpFileName = "manifest.tmp"
 
 	manifestMagic   = "PCRL" // Peacock Raft Log
-	manifestVersion = uint16(1)
+	manifestVersion = uint16(2)
 
-	manifestMagicSize        = 4
-	manifestVersionSize      = 2
-	manifestReservedSize     = 2
-	manifestGenerationSize   = 8
-	manifestSegmentCountSize = 4
+	manifestMagicSize         = 4
+	manifestVersionSize       = 2
+	manifestReservedSize      = 2
+	manifestGenerationSize    = 8
+	manifestSnapshotIndexSize = 8
+	manifestSnapshotTermSize  = 8
+	manifestSegmentCountSize  = 4
 
 	// segmentMeta record: seq(8) | firstIndex(8) | lastIndex(8) | size(8)
 	manifestRecordSize = 32
@@ -30,7 +32,8 @@ const (
 	manifestCRCSize = 4
 
 	manifestHeaderSize = manifestMagicSize + manifestVersionSize + manifestReservedSize +
-		manifestGenerationSize + manifestSegmentCountSize
+		manifestGenerationSize + manifestSnapshotIndexSize + manifestSnapshotTermSize +
+		manifestSegmentCountSize
 	manifestMinSize = manifestHeaderSize + manifestCRCSize
 )
 
@@ -49,9 +52,15 @@ type segmentMeta struct {
 	size       int64
 }
 
+// manifest는 로그 메타의 단일 진실원. snapshotIndex/snapshotTerm은 압축 경계 —
+// TruncateBefore/Reset이 버린 prefix의 마지막 entry (last-included). 경계가 있으면
+// Term(snapshotIndex)는 이 값으로 답하고, FirstIndex는 snapshotIndex+1이다.
+// snapshotIndex==0은 "경계 없음"(아직 압축 안 됨).
 type manifest struct {
-	generation uint64
-	segments   []segmentMeta
+	generation    uint64
+	snapshotIndex uint64
+	snapshotTerm  uint64
+	segments      []segmentMeta
 }
 
 func (m *manifest) active() *segmentMeta {
@@ -122,8 +131,8 @@ func requireSegmentExists(dir string, seq int64) error {
 //
 // 레이아웃 (little-endian):
 //
-//	Magic(4) | Version(2) | Reserved(2) | Generation(8) | SegmentCount(4)
-//	| (Seq(8) | FirstIndex(8) | LastIndex(8) | Size(8))*N | CRC32(4)
+//	Magic(4) | Version(2) | Reserved(2) | Generation(8) | SnapshotIndex(8) | SnapshotTerm(8)
+//	| SegmentCount(4) | (Seq(8) | FirstIndex(8) | LastIndex(8) | Size(8))*N | CRC32(4)
 func (m *manifest) encode() []byte {
 	size := manifestHeaderSize + len(m.segments)*manifestRecordSize + manifestCRCSize
 	buf := make([]byte, size)
@@ -137,6 +146,10 @@ func (m *manifest) encode() []byte {
 	off += manifestReservedSize
 	binary.LittleEndian.PutUint64(buf[off:off+manifestGenerationSize], m.generation)
 	off += manifestGenerationSize
+	binary.LittleEndian.PutUint64(buf[off:off+manifestSnapshotIndexSize], m.snapshotIndex)
+	off += manifestSnapshotIndexSize
+	binary.LittleEndian.PutUint64(buf[off:off+manifestSnapshotTermSize], m.snapshotTerm)
+	off += manifestSnapshotTermSize
 	binary.LittleEndian.PutUint32(buf[off:off+manifestSegmentCountSize], uint32(len(m.segments)))
 	off += manifestSegmentCountSize
 
@@ -182,6 +195,11 @@ func decodeManifest(buf []byte) (*manifest, error) {
 	generation := binary.LittleEndian.Uint64(buf[off : off+manifestGenerationSize])
 	off += manifestGenerationSize
 
+	snapshotIndex := binary.LittleEndian.Uint64(buf[off : off+manifestSnapshotIndexSize])
+	off += manifestSnapshotIndexSize
+	snapshotTerm := binary.LittleEndian.Uint64(buf[off : off+manifestSnapshotTermSize])
+	off += manifestSnapshotTermSize
+
 	segmentCount := binary.LittleEndian.Uint32(buf[off : off+manifestSegmentCountSize])
 	off += manifestSegmentCountSize
 
@@ -207,7 +225,12 @@ func decodeManifest(buf []byte) (*manifest, error) {
 		return nil, fmt.Errorf("%w: crc mismatch", ErrManifestCorrupt)
 	}
 
-	return &manifest{generation: generation, segments: segments}, nil
+	return &manifest{
+		generation:    generation,
+		snapshotIndex: snapshotIndex,
+		snapshotTerm:  snapshotTerm,
+		segments:      segments,
+	}, nil
 }
 
 func readManifest(dir string) (*manifest, error) {

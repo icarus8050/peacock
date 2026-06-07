@@ -19,6 +19,7 @@ func (stubLog) Entries(uint64, uint64, uint64) ([]Entry, error) { return nil, ni
 func (stubLog) Append([]Entry) error                            { return nil }
 func (stubLog) TruncateAfter(uint64) error                      { return nil }
 func (stubLog) TruncateBefore(uint64) error                     { return nil }
+func (stubLog) Reset(uint64, uint64) error                      { return nil }
 func (stubLog) Sync() error                                     { return nil }
 func (stubLog) Close() error                                    { return nil }
 

@@ -114,27 +114,24 @@ func (l *Log) replaySegments() (stale bool, err error) {
 	return stale, nil
 }
 
-// FirstIndex는 로그에 남아 있는 첫 entry의 index를 반환한다. 비어 있으면 0.
-// snapshot truncation 후에는 firstIndex > 1이 될 수 있다(M2 이후).
+// FirstIndex는 로그에 남아 있는 첫 entry의 index를 반환한다. entry가 없고 압축
+// 경계가 있으면 snapshotIndex+1, 둘 다 없으면 0. snapshot 압축 후엔 1보다 클 수 있다.
 func (l *Log) FirstIndex() uint64 {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	for _, s := range l.segments {
-		if s.firstIndex != 0 {
-			return s.firstIndex
-		}
-	}
-	return 0
+	return l.firstIndexLocked()
 }
 
-// LastIndex는 로그의 마지막 entry index를 반환한다. 비어 있으면 0.
+// LastIndex는 로그의 마지막 entry index를 반환한다. entry가 없으면 압축 경계
+// snapshotIndex(경계도 없으면 0).
 func (l *Log) LastIndex() uint64 {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	return l.lastIndexLocked()
 }
 
-// LastTerm은 로그의 마지막 entry term을 반환한다. 비어 있으면 0.
+// LastTerm은 로그의 마지막 entry term을 반환한다. entry가 없으면 압축 경계
+// snapshotTerm(경계도 없으면 0).
 func (l *Log) LastTerm() uint64 {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -347,6 +344,12 @@ func (l *Log) TruncateBefore(index uint64) error {
 		return fmt.Errorf("raftlog: TruncateBefore index=%d >= lastIndex=%d (snapshot install reset required)", index, last)
 	}
 
+	// 경계 term을 폐기 전에 캡처한다 — 압축 후 Term(index)는 이 값으로 답해야 한다.
+	boundaryTerm, err := l.termLocked(index)
+	if err != nil {
+		return fmt.Errorf("raftlog: TruncateBefore term(%d): %w", index, err)
+	}
+
 	boundIdx, _, ok := l.findSegmentLocked(index + 1)
 	if !ok {
 		return fmt.Errorf("raftlog: TruncateBefore boundary (index+1=%d) not found", index+1)
@@ -377,7 +380,7 @@ func (l *Log) TruncateBefore(index uint64) error {
 		}
 	}
 
-	if err := l.persistManifestLocked(nextSegments); err != nil {
+	if err := l.persistManifestBoundaryLocked(nextSegments, index, boundaryTerm); err != nil {
 		l.closed = true
 		return err
 	}
@@ -393,6 +396,46 @@ func (l *Log) TruncateBefore(index uint64) error {
 		}
 		_ = os.Remove(oldBoundPath)
 	}
+	return nil
+}
+
+// Reset은 모든 entry를 폐기하고 로그를 압축 경계 (index, term)에서 다시 시작시킨다 —
+// snapshot이 로그 전체를 흡수하거나(TruncateBefore가 거절하는 index>=lastIndex 케이스)
+// InstallSnapshot 수신으로 follower 로그를 통째로 갈아끼울 때 쓴다. 호출 후
+// FirstIndex()는 index+1, LastIndex()는 index, Term(index)는 term을 반환하고 다음
+// Append는 index+1로 이어진다.
+//
+// 새 빈 segment 파일 생성 → 활성 전환 → 매니페스트 commit(단일 결정 포인트) → 옛 파일
+// unlink 순. commit 전 크래시면 새 파일은 매니페스트 밖 고아, 이후면 옛 파일이 고아.
+//
+// 계약: (index, term)은 호출자(raft)가 주는 snapshot 경계다 — index는 현재 경계 이상의
+// 단조 증가여야 하며(snapshot index는 되돌아가지 않는다), log 레이어는 이를 검증하지
+// 않는다(경계 값의 정합성은 raft state machine 불변식의 책임).
+func (l *Log) Reset(index, term uint64) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.closed {
+		return ErrClosed
+	}
+
+	newSeq := l.maxSeqLocked() + 1
+	newPath := segmentPath(l.dir, newSeq)
+	if err := writeSegmentFile(newPath, nil); err != nil {
+		return err
+	}
+	newSeg := &segState{seq: newSeq}
+
+	old := l.segments
+	if err := l.swapActiveToLocked(newPath); err != nil {
+		_ = os.Remove(newPath)
+		return err
+	}
+	if err := l.persistManifestBoundaryLocked([]*segState{newSeg}, index, term); err != nil {
+		l.closed = true
+		return err
+	}
+	l.segments = []*segState{newSeg}
+	l.unlinkSegmentsLocked(old)
 	return nil
 }
 
@@ -434,25 +477,38 @@ func (l *Log) Close() error {
 
 // ─── 내부 헬퍼 ─────────────────────────────────────────────────────────────
 
+// firstIndexLocked는 남아 있는 첫 entry index. entry가 있으면 첫 entry, 없고 압축
+// 경계가 있으면 snapshotIndex+1(다음 기대 index), 둘 다 없으면 0.
 func (l *Log) firstIndexLocked() uint64 {
 	for _, s := range l.segments {
 		if s.firstIndex != 0 {
 			return s.firstIndex
 		}
 	}
+	if l.manifest.snapshotIndex != 0 {
+		return l.manifest.snapshotIndex + 1
+	}
 	return 0
 }
 
+// lastIndexLocked는 마지막 entry index. entry가 없으면 압축 경계 snapshotIndex로
+// 떨어진다(경계 없으면 0) — Reset/전체압축 후 다음 Append가 snapshotIndex+1로 이어진다.
 func (l *Log) lastIndexLocked() uint64 {
 	for i := len(l.segments) - 1; i >= 0; i-- {
 		if l.segments[i].lastIndex != 0 {
 			return l.segments[i].lastIndex
 		}
 	}
-	return 0
+	return l.manifest.snapshotIndex
 }
 
+// termLocked는 index의 term. index가 압축 경계(snapshotIndex)면 snapshotTerm으로
+// 답한다 — 경계 entry는 로그에서 사라졌지만 replication의 prevLogTerm 검사에 필요하다.
+// 경계보다 더 앞(이미 압축됨)이나 범위 밖이면 ErrOutOfRange.
 func (l *Log) termLocked(index uint64) (uint64, error) {
+	if index != 0 && index == l.manifest.snapshotIndex {
+		return l.manifest.snapshotTerm, nil
+	}
 	segIdx, _, ok := l.findSegmentLocked(index)
 	if !ok {
 		return 0, fmt.Errorf("%w: index=%d", ErrOutOfRange, index)
@@ -725,9 +781,18 @@ func (l *Log) reopenAsActiveLocked(f *os.File, path string) error {
 // persist를 시도할 수 있게 한다 — 실패 시 l.segments는 손대지 않으므로 rollback이
 // 필요 없다.
 func (l *Log) persistManifestLocked(segments []*segState) error {
+	return l.persistManifestBoundaryLocked(segments, l.manifest.snapshotIndex, l.manifest.snapshotTerm)
+}
+
+// persistManifestBoundaryLocked는 압축 경계(snapshotIndex/Term)를 명시해 매니페스트를
+// 영속화한다. roll/TruncateAfter는 경계를 유지(persistManifestLocked)하고,
+// TruncateBefore/Reset만 새 경계를 지정해 이 함수를 직접 부른다.
+func (l *Log) persistManifestBoundaryLocked(segments []*segState, snapIdx, snapTerm uint64) error {
 	next := &manifest{
-		generation: l.manifest.generation + 1,
-		segments:   make([]segmentMeta, len(segments)),
+		generation:    l.manifest.generation + 1,
+		snapshotIndex: snapIdx,
+		snapshotTerm:  snapTerm,
+		segments:      make([]segmentMeta, len(segments)),
 	}
 	for i, s := range segments {
 		next.segments[i] = segmentMeta{

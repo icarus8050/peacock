@@ -10,8 +10,10 @@ import (
 // election.go가 자기 mu를 든 채 다른 노드의 HandleAppendEntries로 진입하므로 같은
 // log이 두 노드 사이에서 동시 접근되진 않지만, race detector를 통과시키려 mu 사용.
 type fakeLog struct {
-	mu      sync.Mutex
-	entries []Entry
+	mu        sync.Mutex
+	entries   []Entry
+	snapIndex uint64 // 압축 경계 (last-included); 0 = 없음
+	snapTerm  uint64
 }
 
 func newFakeLog() *fakeLog { return &fakeLog{} }
@@ -39,6 +41,9 @@ func (l *fakeLog) FirstIndex() uint64 {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if len(l.entries) == 0 {
+		if l.snapIndex != 0 {
+			return l.snapIndex + 1
+		}
 		return 0
 	}
 	return l.entries[0].Index
@@ -48,7 +53,7 @@ func (l *fakeLog) LastIndex() uint64 {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if len(l.entries) == 0 {
-		return 0
+		return l.snapIndex
 	}
 	return l.entries[len(l.entries)-1].Index
 }
@@ -57,7 +62,7 @@ func (l *fakeLog) LastTerm() uint64 {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if len(l.entries) == 0 {
-		return 0
+		return l.snapTerm
 	}
 	return l.entries[len(l.entries)-1].Term
 }
@@ -65,6 +70,9 @@ func (l *fakeLog) LastTerm() uint64 {
 func (l *fakeLog) Term(index uint64) (uint64, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	if index != 0 && index == l.snapIndex {
+		return l.snapTerm, nil
+	}
 	for _, e := range l.entries {
 		if e.Index == index {
 			return e.Term, nil
@@ -105,6 +113,30 @@ func (l *fakeLog) TruncateAfter(index uint64) error {
 	return nil
 }
 
-func (l *fakeLog) TruncateBefore(uint64) error { return nil }
-func (l *fakeLog) Sync() error                 { return nil }
-func (l *fakeLog) Close() error                { return nil }
+func (l *fakeLog) TruncateBefore(index uint64) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	var keep []Entry
+	for _, e := range l.entries {
+		if e.Index > index {
+			keep = append(keep, e)
+		} else if e.Index == index {
+			l.snapIndex = e.Index
+			l.snapTerm = e.Term
+		}
+	}
+	l.entries = keep
+	return nil
+}
+
+func (l *fakeLog) Reset(index, term uint64) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.entries = nil
+	l.snapIndex = index
+	l.snapTerm = term
+	return nil
+}
+
+func (l *fakeLog) Sync() error  { return nil }
+func (l *fakeLog) Close() error { return nil }
