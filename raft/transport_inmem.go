@@ -109,3 +109,11 @@ func (t *inMemTransport) SendAppendEntries(ctx context.Context, to NodeID, args 
 	}
 	return handler.HandleAppendEntries(ctx, args)
 }
+
+func (t *inMemTransport) SendInstallSnapshot(ctx context.Context, to NodeID, args InstallSnapshotArgs) (InstallSnapshotReply, error) {
+	handler, err := t.hub.route(t.self, to)
+	if err != nil {
+		return InstallSnapshotReply{}, err
+	}
+	return handler.HandleInstallSnapshot(ctx, args)
+}

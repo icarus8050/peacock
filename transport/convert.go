@@ -2,6 +2,7 @@ package transport
 
 import (
 	"fmt"
+	"io"
 
 	"peacock/raft"
 	"peacock/raft/pb"
@@ -123,6 +124,36 @@ func appendEntriesReplyFromPb(r *pb.AppendEntriesResponse) raft.AppendEntriesRep
 		ConflictIndex: r.GetConflictIndex(),
 		ConflictTerm:  r.GetConflictTerm(),
 	}
+}
+
+// installSnapshotMetaToPb는 InstallSnapshot args의 메타 부분을 pb.SnapshotMeta로 만든다.
+// Data 스트림은 별도 data 청크로 보내므로 여기 포함하지 않는다. configuration은 M3.
+func installSnapshotMetaToPb(a raft.InstallSnapshotArgs) *pb.SnapshotMeta {
+	return &pb.SnapshotMeta{
+		Term:              a.Term,
+		LeaderId:          string(a.LeaderID),
+		LastIncludedIndex: a.LastIncludedIndex,
+		LastIncludedTerm:  a.LastIncludedTerm,
+	}
+}
+
+// installSnapshotArgsFromPb는 수신한 meta와 모은 data 스트림으로 args를 만든다.
+func installSnapshotArgsFromPb(m *pb.SnapshotMeta, data io.Reader) raft.InstallSnapshotArgs {
+	return raft.InstallSnapshotArgs{
+		Term:              m.GetTerm(),
+		LeaderID:          raft.NodeID(m.GetLeaderId()),
+		LastIncludedIndex: m.GetLastIncludedIndex(),
+		LastIncludedTerm:  m.GetLastIncludedTerm(),
+		Data:              data,
+	}
+}
+
+func installSnapshotReplyToPb(r raft.InstallSnapshotReply) *pb.InstallSnapshotResponse {
+	return &pb.InstallSnapshotResponse{Term: r.Term}
+}
+
+func installSnapshotReplyFromPb(r *pb.InstallSnapshotResponse) raft.InstallSnapshotReply {
+	return raft.InstallSnapshotReply{Term: r.GetTerm()}
 }
 
 // errf는 transport 패키지 에러를 일관 prefix로 감싼다.

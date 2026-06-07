@@ -1,8 +1,11 @@
 package transport
 
 import (
+	"bytes"
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"net"
 
 	"google.golang.org/grpc"
@@ -13,8 +16,8 @@ import (
 	"peacock/raft/pb"
 )
 
-// Server는 한 raft 노드의 gRPC 진입점. 들어온 RPC를 raft.RPCHandler로 dispatch한다.
-// InstallSnapshot은 M2 자리 — 현재는 Unimplemented.
+// Server는 한 raft 노드의 gRPC 진입점. 들어온 RPC(RequestVote/AppendEntries/
+// InstallSnapshot)를 raft.RPCHandler로 dispatch한다.
 type Server struct {
 	pb.UnimplementedRaftServer
 	handler raft.RPCHandler
@@ -64,4 +67,44 @@ func (s *Server) AppendEntries(ctx context.Context, req *pb.AppendEntriesRequest
 		return nil, status.Errorf(codes.Internal, "AppendEntries: %v", err)
 	}
 	return appendEntriesReplyToPb(reply), nil
+}
+
+// InstallSnapshot은 client-streaming RPC를 받아 meta + data 청크를 모은 뒤 raft.RPCHandler로
+// dispatch한다. M2는 data를 메모리에 모아 reader로 넘긴다(작은 snapshot 가정 — disk로
+// 스트리밍하는 최적화는 후순위). 첫 청크는 meta여야 한다.
+func (s *Server) InstallSnapshot(stream pb.Raft_InstallSnapshotServer) error {
+	meta, data, err := recvSnapshotStream(stream)
+	if err != nil {
+		return err
+	}
+	reply, err := s.handler.HandleInstallSnapshot(stream.Context(), installSnapshotArgsFromPb(meta, data))
+	if err != nil {
+		return status.Errorf(codes.Internal, "InstallSnapshot: %v", err)
+	}
+	return stream.SendAndClose(installSnapshotReplyToPb(reply))
+}
+
+// recvSnapshotStream은 스트림에서 meta 청크와 data 청크들을 모아 반환한다.
+func recvSnapshotStream(stream pb.Raft_InstallSnapshotServer) (*pb.SnapshotMeta, *bytes.Buffer, error) {
+	var meta *pb.SnapshotMeta
+	var buf bytes.Buffer
+	for {
+		chunk, err := stream.Recv()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			return nil, nil, status.Errorf(codes.Internal, "InstallSnapshot recv: %v", err)
+		}
+		switch p := chunk.GetPayload().(type) {
+		case *pb.InstallSnapshotChunk_Meta:
+			meta = p.Meta
+		case *pb.InstallSnapshotChunk_Data:
+			buf.Write(p.Data)
+		}
+	}
+	if meta == nil {
+		return nil, nil, status.Error(codes.InvalidArgument, "InstallSnapshot: missing meta chunk")
+	}
+	return meta, &buf, nil
 }

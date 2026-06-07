@@ -10,10 +10,13 @@ import (
 type fakeHandler struct {
 	voteReply      RequestVoteReply
 	appendReply    AppendEntriesReply
+	snapReply      InstallSnapshotReply
 	voteCalls      int
 	appendCalls    int
+	snapCalls      int
 	lastVoteArgs   RequestVoteArgs
 	lastAppendArgs AppendEntriesArgs
+	lastSnapArgs   InstallSnapshotArgs
 }
 
 func (h *fakeHandler) HandleRequestVote(ctx context.Context, args RequestVoteArgs) (RequestVoteReply, error) {
@@ -26,6 +29,34 @@ func (h *fakeHandler) HandleAppendEntries(ctx context.Context, args AppendEntrie
 	h.appendCalls++
 	h.lastAppendArgs = args
 	return h.appendReply, nil
+}
+
+func (h *fakeHandler) HandleInstallSnapshot(ctx context.Context, args InstallSnapshotArgs) (InstallSnapshotReply, error) {
+	h.snapCalls++
+	h.lastSnapArgs = args
+	return h.snapReply, nil
+}
+
+func TestInMem_RoutesInstallSnapshot(t *testing.T) {
+	hub := newInMemHub()
+	h2 := &fakeHandler{snapReply: InstallSnapshotReply{Term: 4}}
+	hub.Register("node-2", h2)
+
+	t1 := newInMemTransport("node-1", hub)
+	args := InstallSnapshotArgs{Term: 4, LeaderID: "node-1", LastIncludedIndex: 9, LastIncludedTerm: 2}
+	reply, err := t1.SendInstallSnapshot(context.Background(), "node-2", args)
+	if err != nil {
+		t.Fatalf("SendInstallSnapshot: %v", err)
+	}
+	if reply.Term != 4 {
+		t.Fatalf("reply term: got %d, want 4", reply.Term)
+	}
+	if h2.snapCalls != 1 {
+		t.Fatalf("handler snapCalls: got %d, want 1", h2.snapCalls)
+	}
+	if h2.lastSnapArgs.LastIncludedIndex != 9 || h2.lastSnapArgs.LastIncludedTerm != 2 {
+		t.Fatalf("args not routed intact: %+v", h2.lastSnapArgs)
+	}
 }
 
 func TestInMem_UnregisterStopsDelivery(t *testing.T) {

@@ -27,6 +27,12 @@ func (n *Node) broadcastAppendEntriesLocked() {
 // 성공 시 matchIndex/nextIndex를 진전, reply.Term이 더 크면 follower로 step down,
 // reply.Success=false면 conflict hint로 nextIndex를 backoff해 다음 broadcast에서 재시도.
 func (n *Node) sendAppendEntriesToLocked(id NodeID) {
+	// follower가 압축 경계보다 뒤처졌으면 leader는 그 자리 entry를 더 이상 갖고 있지
+	// 않다 — AppendEntries 대신 snapshot을 통째로 보낸다.
+	if n.nextIndex[id] <= n.snapshotIndexLocked() {
+		n.sendInstallSnapshotToLocked(id)
+		return
+	}
 	args, err := n.buildAppendEntriesArgs(id)
 	if err != nil {
 		return // leader 자기 log invariant 깨짐(자기 nextIndex가 자기 log 범위 밖) — 정상 흐름엔 없음, logger 도입 자리

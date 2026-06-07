@@ -12,6 +12,7 @@ import (
 type fakeTransport struct {
 	voteReply   func(to NodeID, args RequestVoteArgs) (RequestVoteReply, error)
 	appendReply func(to NodeID, args AppendEntriesArgs) (AppendEntriesReply, error)
+	snapReply   func(to NodeID, args InstallSnapshotArgs) (InstallSnapshotReply, error)
 }
 
 func (f *fakeTransport) SendRequestVote(_ context.Context, to NodeID, args RequestVoteArgs) (RequestVoteReply, error) {
@@ -26,6 +27,13 @@ func (f *fakeTransport) SendAppendEntries(_ context.Context, to NodeID, args App
 		return AppendEntriesReply{}, nil
 	}
 	return f.appendReply(to, args)
+}
+
+func (f *fakeTransport) SendInstallSnapshot(_ context.Context, to NodeID, args InstallSnapshotArgs) (InstallSnapshotReply, error) {
+	if f.snapReply == nil {
+		return InstallSnapshotReply{}, nil
+	}
+	return f.snapReply(to, args)
 }
 
 func newRaftTestNode(t *testing.T, peers []PeerInfo, tx Transport, lg Log) *Node {

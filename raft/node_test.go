@@ -37,6 +37,9 @@ func (stubTransport) SendRequestVote(context.Context, NodeID, RequestVoteArgs) (
 func (stubTransport) SendAppendEntries(context.Context, NodeID, AppendEntriesArgs) (AppendEntriesReply, error) {
 	return AppendEntriesReply{}, nil
 }
+func (stubTransport) SendInstallSnapshot(context.Context, NodeID, InstallSnapshotArgs) (InstallSnapshotReply, error) {
+	return InstallSnapshotReply{}, nil
+}
 
 func newTestNode(t *testing.T) *Node {
 	t.Helper()

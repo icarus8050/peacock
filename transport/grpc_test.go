@@ -1,6 +1,7 @@
 package transport_test
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -16,6 +17,7 @@ import (
 
 	"peacock/node"
 	"peacock/raft"
+	"peacock/transport"
 )
 
 // 통합 테스트: bufconn 위에 3노드 raft cluster를 in-process로 띄워 election 수렴, Propose,
@@ -78,6 +80,124 @@ func TestGRPCCluster_ElectionAndPropose(t *testing.T) {
 		}
 		return true
 	})
+}
+
+// recordingHandler는 InstallSnapshot으로 받은 meta와 재조립된 data를 보존하는
+// RPCHandler — gRPC client-streaming(청크 분할) ↔ server(재조립) 왕복을 검증한다.
+type recordingHandler struct {
+	mu        sync.Mutex
+	snapArgs  raft.InstallSnapshotArgs
+	snapData  []byte
+	replyTerm uint64
+}
+
+func (h *recordingHandler) HandleRequestVote(context.Context, raft.RequestVoteArgs) (raft.RequestVoteReply, error) {
+	return raft.RequestVoteReply{}, nil
+}
+
+func (h *recordingHandler) HandleAppendEntries(context.Context, raft.AppendEntriesArgs) (raft.AppendEntriesReply, error) {
+	return raft.AppendEntriesReply{}, nil
+}
+
+func (h *recordingHandler) HandleInstallSnapshot(_ context.Context, args raft.InstallSnapshotArgs) (raft.InstallSnapshotReply, error) {
+	data, err := io.ReadAll(args.Data)
+	if err != nil {
+		return raft.InstallSnapshotReply{}, err
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.snapArgs = args
+	h.snapData = data
+	return raft.InstallSnapshotReply{Term: h.replyTerm}, nil
+}
+
+func TestGRPCInstallSnapshot_StreamsMetaAndData(t *testing.T) {
+	lis := bufconn.Listen(1 << 20)
+	rec := &recordingHandler{replyTerm: 9}
+	srv := transport.NewServer(lis, rec)
+	go func() { _ = srv.Serve() }()
+	t.Cleanup(srv.Stop)
+
+	dialer := func(_ context.Context, _ string) (*grpc.ClientConn, error) {
+		return grpc.NewClient(
+			"passthrough:///bufconn",
+			grpc.WithTransportCredentials(insecure.NewCredentials()),
+			grpc.WithContextDialer(func(c context.Context, _ string) (net.Conn, error) {
+				return lis.DialContext(c)
+			}),
+		)
+	}
+	tr := transport.NewGRPCTransport(dialer, 2*time.Second)
+	tr.UpdatePeer("node-2", "node-2")
+	t.Cleanup(tr.Close)
+
+	// chunk size(64KB)를 넘겨 다중 데이터 청크 경로를 강제.
+	payload := bytes.Repeat([]byte("abcd"), 60*1024) // 240KB
+	args := raft.InstallSnapshotArgs{
+		Term:              3,
+		LeaderID:          "node-1",
+		LastIncludedIndex: 7,
+		LastIncludedTerm:  2,
+		Data:              bytes.NewReader(payload),
+	}
+	reply, err := tr.SendInstallSnapshot(context.Background(), "node-2", args)
+	if err != nil {
+		t.Fatalf("SendInstallSnapshot: %v", err)
+	}
+	if reply.Term != 9 {
+		t.Fatalf("reply term: got %d, want 9", reply.Term)
+	}
+
+	rec.mu.Lock()
+	defer rec.mu.Unlock()
+	if rec.snapArgs.Term != 3 || rec.snapArgs.LeaderID != "node-1" ||
+		rec.snapArgs.LastIncludedIndex != 7 || rec.snapArgs.LastIncludedTerm != 2 {
+		t.Fatalf("meta mismatch: %+v", rec.snapArgs)
+	}
+	if !bytes.Equal(rec.snapData, payload) {
+		t.Fatalf("data mismatch: got %d bytes, want %d", len(rec.snapData), len(payload))
+	}
+}
+
+func TestGRPCInstallSnapshot_EmptySnapshot(t *testing.T) {
+	// 0바이트 snapshot: meta만 보내고 data 청크 없음 → 서버가 빈 reader로 dispatch.
+	lis := bufconn.Listen(1 << 20)
+	rec := &recordingHandler{replyTerm: 2}
+	srv := transport.NewServer(lis, rec)
+	go func() { _ = srv.Serve() }()
+	t.Cleanup(srv.Stop)
+
+	dialer := func(_ context.Context, _ string) (*grpc.ClientConn, error) {
+		return grpc.NewClient(
+			"passthrough:///bufconn",
+			grpc.WithTransportCredentials(insecure.NewCredentials()),
+			grpc.WithContextDialer(func(c context.Context, _ string) (net.Conn, error) {
+				return lis.DialContext(c)
+			}),
+		)
+	}
+	tr := transport.NewGRPCTransport(dialer, 2*time.Second)
+	tr.UpdatePeer("node-2", "node-2")
+	t.Cleanup(tr.Close)
+
+	args := raft.InstallSnapshotArgs{
+		Term:              2,
+		LeaderID:          "node-1",
+		LastIncludedIndex: 4,
+		LastIncludedTerm:  1,
+		Data:              bytes.NewReader(nil),
+	}
+	if _, err := tr.SendInstallSnapshot(context.Background(), "node-2", args); err != nil {
+		t.Fatalf("SendInstallSnapshot: %v", err)
+	}
+	rec.mu.Lock()
+	defer rec.mu.Unlock()
+	if len(rec.snapData) != 0 {
+		t.Fatalf("expected empty data, got %d bytes", len(rec.snapData))
+	}
+	if rec.snapArgs.LastIncludedIndex != 4 {
+		t.Fatalf("meta mismatch: %+v", rec.snapArgs)
+	}
 }
 
 // 아래 헬퍼는 테스트 전용 cluster harness.

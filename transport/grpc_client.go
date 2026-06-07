@@ -2,6 +2,8 @@ package transport
 
 import (
 	"context"
+	"errors"
+	"io"
 	"sync"
 	"time"
 
@@ -11,6 +13,10 @@ import (
 	"peacock/raft"
 	"peacock/raft/pb"
 )
+
+// snapshotChunkSize는 InstallSnapshot data를 나눠 보내는 청크 크기. snapshot 전체를 한
+// gRPC 메시지에 담지 않기 위함.
+const snapshotChunkSize = 64 * 1024
 
 // Dialer는 peer 주소로 grpc.ClientConn을 만드는 함수. 프로덕션에선 grpc.NewClient에 TLS/DNS
 // 옵션을 추가, 테스트에선 bufconn 기반 dialer 주입.
@@ -115,6 +121,64 @@ func (t *GRPCTransport) SendAppendEntries(ctx context.Context, to raft.NodeID, a
 		return raft.AppendEntriesReply{}, errf("AppendEntries to %s: %w", to, err)
 	}
 	return appendEntriesReplyFromPb(resp), nil
+}
+
+// SendInstallSnapshot은 raft.Transport 구현 — client-streaming으로 meta 청크를 먼저,
+// 이어 data를 snapshotChunkSize 단위로 나눠 보내고 응답을 받는다.
+func (t *GRPCTransport) SendInstallSnapshot(ctx context.Context, to raft.NodeID, args raft.InstallSnapshotArgs) (raft.InstallSnapshotReply, error) {
+	conn, err := t.connFor(ctx, to)
+	if err != nil {
+		return raft.InstallSnapshotReply{}, err
+	}
+	ctx, cancel := t.withTimeout(ctx)
+	defer cancel()
+	stream, err := pb.NewRaftClient(conn).InstallSnapshot(ctx)
+	if err != nil {
+		return raft.InstallSnapshotReply{}, errf("InstallSnapshot to %s: %w", to, err)
+	}
+
+	metaChunk := &pb.InstallSnapshotChunk{
+		Payload: &pb.InstallSnapshotChunk_Meta{Meta: installSnapshotMetaToPb(args)},
+	}
+	if err := stream.Send(metaChunk); err != nil {
+		return raft.InstallSnapshotReply{}, errf("InstallSnapshot meta to %s: %w", to, err)
+	}
+	if err := streamSnapshotData(stream, args.Data); err != nil {
+		return raft.InstallSnapshotReply{}, errf("InstallSnapshot data to %s: %w", to, err)
+	}
+
+	resp, err := stream.CloseAndRecv()
+	if err != nil {
+		return raft.InstallSnapshotReply{}, errf("InstallSnapshot close to %s: %w", to, err)
+	}
+	return installSnapshotReplyFromPb(resp), nil
+}
+
+// streamSnapshotData는 data를 청크로 읽어 차례로 전송한다. Send가 io.EOF면 서버가
+// 스트림을 일찍 닫은 것 — 실제 에러는 CloseAndRecv가 surface하므로 여기선 nil로
+// 빠져나가 호출자가 CloseAndRecv로 진단을 받게 한다(gRPC client-streaming 관용구).
+func streamSnapshotData(stream pb.Raft_InstallSnapshotClient, data io.Reader) error {
+	buf := make([]byte, snapshotChunkSize)
+	for {
+		n, rerr := data.Read(buf)
+		if n > 0 {
+			chunk := &pb.InstallSnapshotChunk{
+				Payload: &pb.InstallSnapshotChunk_Data{Data: append([]byte(nil), buf[:n]...)},
+			}
+			if err := stream.Send(chunk); err != nil {
+				if errors.Is(err, io.EOF) {
+					return nil
+				}
+				return err
+			}
+		}
+		if errors.Is(rerr, io.EOF) {
+			return nil
+		}
+		if rerr != nil {
+			return rerr
+		}
+	}
 }
 
 // connFor는 peer의 ClientConn을 캐시에서 가져오거나 dial한다.

@@ -2,6 +2,7 @@ package raft
 
 import (
 	"bytes"
+	"context"
 	"io"
 	"sync"
 	"testing"
@@ -87,6 +88,189 @@ func newRaftTestNodeWithDeps(t *testing.T, lg Log, snap SnapshotStore, sm StateM
 		t.Fatalf("NewNode: %v", err)
 	}
 	return n
+}
+
+// newHubNode는 inMemHub에 연결된 노드를 만든다 — InstallSnapshot 2노드 시나리오용.
+func newHubNode(t *testing.T, id NodeID, hub *inMemHub, lg Log, snap SnapshotStore, sm StateMachine) *Node {
+	t.Helper()
+	cfg := Config{
+		ID:                 id,
+		Dir:                t.TempDir(),
+		TickInterval:       1 * time.Millisecond,
+		HeartbeatInterval:  2 * time.Millisecond,
+		ElectionTimeoutMin: 5 * time.Millisecond,
+		ElectionTimeoutMax: 10 * time.Millisecond,
+	}
+	n, err := NewNode(cfg, lg, sm, snap, newInMemTransport(id, hub), []PeerInfo{{ID: "node-1"}, {ID: "node-2"}})
+	if err != nil {
+		t.Fatalf("NewNode %s: %v", id, err)
+	}
+	hub.Register(id, n)
+	return n
+}
+
+func TestInstallSnapshot_FollowerInstalls(t *testing.T) {
+	lg := newFakeLog()
+	for i := uint64(1); i <= 3; i++ {
+		if err := lg.Append([]Entry{mkRaftEntry(i, 1, []byte{byte(i)})}); err != nil {
+			t.Fatalf("append %d: %v", i, err)
+		}
+	}
+	sm := &bufferSM{}
+	n := newRaftTestNodeWithDeps(t, lg, newMemSnap(), sm)
+
+	args := InstallSnapshotArgs{
+		Term:              1,
+		LeaderID:          "node-2",
+		LastIncludedIndex: 5,
+		LastIncludedTerm:  1,
+		Data:              bytes.NewReader([]byte("snapshot-state")),
+	}
+	reply, err := n.HandleInstallSnapshot(context.Background(), args)
+	if err != nil {
+		t.Fatalf("HandleInstallSnapshot: %v", err)
+	}
+	if reply.Term != 1 {
+		t.Fatalf("reply term: got %d, want 1", reply.Term)
+	}
+	if !bytes.Equal(sm.data, []byte("snapshot-state")) {
+		t.Fatalf("SM not restored: got %q", sm.data)
+	}
+	if got := lg.FirstIndex(); got != 6 {
+		t.Fatalf("log not reset: FirstIndex got %d, want 6", got)
+	}
+	if n.lastApplied != 5 || n.commitIndex != 5 {
+		t.Fatalf("progress: lastApplied=%d commitIndex=%d, want 5", n.lastApplied, n.commitIndex)
+	}
+}
+
+func TestInstallSnapshot_IdempotentSkip(t *testing.T) {
+	sm := &bufferSM{}
+	n := newRaftTestNodeWithDeps(t, newFakeLog(), newMemSnap(), sm)
+	n.commitIndex = 10 // 이미 더 앞서 있음
+
+	args := InstallSnapshotArgs{
+		Term:              1,
+		LeaderID:          "node-2",
+		LastIncludedIndex: 5,
+		LastIncludedTerm:  1,
+		Data:              bytes.NewReader([]byte("stale")),
+	}
+	if _, err := n.HandleInstallSnapshot(context.Background(), args); err != nil {
+		t.Fatalf("HandleInstallSnapshot: %v", err)
+	}
+	if len(sm.data) != 0 {
+		t.Fatalf("stale snapshot should be skipped, SM got %q", sm.data)
+	}
+	if n.commitIndex != 10 {
+		t.Fatalf("commitIndex should be unchanged: got %d, want 10", n.commitIndex)
+	}
+}
+
+func TestInstallSnapshot_LaggingFollowerCatchesUp(t *testing.T) {
+	hub := newInMemHub()
+
+	fSM := &bufferSM{}
+	follower := newHubNode(t, "node-2", hub, newFakeLog(), newMemSnap(), fSM)
+
+	// leader: index=5 snapshot 보유, 로그는 그 경계까지 압축됨.
+	lSnap := newMemSnap()
+	w, err := lSnap.Create(SnapshotMeta{Index: 5, Term: 1})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if _, err := w.Write([]byte("leader-state")); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if err := w.Commit(); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+	lLog := newFakeLog()
+	if err := lLog.Reset(5, 1); err != nil { // 압축: FirstIndex=6, snapshotIndex=5
+		t.Fatalf("reset: %v", err)
+	}
+	leader := newHubNode(t, "node-1", hub, lLog, lSnap, &bufferSM{})
+	leader.currentTerm = 1
+	setLeader(t, leader, "node-1", "node-2")
+	leader.nextIndex["node-2"] = 1 // 경계(5)보다 뒤처짐 → InstallSnapshot 경로
+
+	leader.mu.Lock()
+	leader.sendAppendEntriesToLocked("node-2")
+	leader.mu.Unlock()
+
+	if !bytes.Equal(fSM.data, []byte("leader-state")) {
+		t.Fatalf("follower not caught up via snapshot: SM got %q", fSM.data)
+	}
+	follower.mu.Lock()
+	fApplied := follower.lastApplied
+	follower.mu.Unlock()
+	if fApplied != 5 {
+		t.Fatalf("follower lastApplied: got %d, want 5", fApplied)
+	}
+	if leader.matchIndex["node-2"] != 5 || leader.nextIndex["node-2"] != 6 {
+		t.Fatalf("leader progress for follower: match=%d next=%d, want 5/6",
+			leader.matchIndex["node-2"], leader.nextIndex["node-2"])
+	}
+}
+
+func TestInstallSnapshot_HigherTermReplyStepsDown(t *testing.T) {
+	snap := newMemSnap()
+	w, err := snap.Create(SnapshotMeta{Index: 5, Term: 1})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if _, err := w.Write([]byte("s")); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if err := w.Commit(); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+	lg := newFakeLog()
+	if err := lg.Reset(5, 1); err != nil {
+		t.Fatalf("reset: %v", err)
+	}
+	n := newRaftTestNodeWithDeps(t, lg, snap, &bufferSM{})
+	n.currentTerm = 1
+	n.transport = &fakeTransport{
+		snapReply: func(NodeID, InstallSnapshotArgs) (InstallSnapshotReply, error) {
+			return InstallSnapshotReply{Term: 5}, nil // 더 큰 term
+		},
+	}
+	setLeader(t, n, "node-1", "node-2")
+	n.nextIndex["node-2"] = 1 // 경계보다 뒤처짐 → InstallSnapshot 송신
+
+	n.mu.Lock()
+	n.sendAppendEntriesToLocked("node-2")
+	n.mu.Unlock()
+
+	if n.role != RoleFollower {
+		t.Fatalf("expected step down to follower, role=%v", n.role)
+	}
+	if n.currentTerm != 5 {
+		t.Fatalf("expected currentTerm=5 after stepdown, got %d", n.currentTerm)
+	}
+}
+
+func TestInstallSnapshot_EmptySnapshot(t *testing.T) {
+	// 0바이트 snapshot도 정상 설치돼야 한다(meta만, data 청크 없음).
+	sm := &bufferSM{}
+	n := newRaftTestNodeWithDeps(t, newFakeLog(), newMemSnap(), sm)
+	args := InstallSnapshotArgs{
+		Term:              1,
+		LeaderID:          "node-2",
+		LastIncludedIndex: 3,
+		LastIncludedTerm:  1,
+		Data:              bytes.NewReader(nil),
+	}
+	if _, err := n.HandleInstallSnapshot(context.Background(), args); err != nil {
+		t.Fatalf("HandleInstallSnapshot: %v", err)
+	}
+	if len(sm.data) != 0 {
+		t.Fatalf("empty snapshot should restore empty state, got %q", sm.data)
+	}
+	if n.lastApplied != 3 || n.commitIndex != 3 {
+		t.Fatalf("progress: lastApplied=%d commitIndex=%d, want 3", n.lastApplied, n.commitIndex)
+	}
 }
 
 func TestSnapshot_TriggersAndCompacts(t *testing.T) {

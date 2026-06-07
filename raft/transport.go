@@ -1,6 +1,9 @@
 package raft
 
-import "context"
+import (
+	"context"
+	"io"
+)
 
 // 와이어 표현(pb)과 분리된 raft 코어 RPC 메시지 타입.
 // transport 어댑터(grpc 등)가 경계에서 pb ↔ 이 타입을 변환한다.
@@ -35,11 +38,27 @@ type AppendEntriesReply struct {
 	ConflictTerm  uint64
 }
 
+// InstallSnapshotArgs는 leader가 압축 경계보다 뒤처진 follower에게 snapshot을 통째로
+// 보낼 때의 인자. Data는 snapshot 바이트 스트림 — transport가 청크로 나눠 전송한다
+// (whole을 한 메시지에 담지 않음).
+type InstallSnapshotArgs struct {
+	Term              uint64
+	LeaderID          NodeID
+	LastIncludedIndex uint64
+	LastIncludedTerm  uint64
+	Data              io.Reader
+}
+
+type InstallSnapshotReply struct {
+	Term uint64
+}
+
 // Transport는 raft.Node가 peer로 RPC를 보낼 때 쓰는 송신 측 인터페이스.
 // 구현은 in-memory(테스트용) 또는 gRPC(transport 패키지) 중 하나.
 type Transport interface {
 	SendRequestVote(ctx context.Context, to NodeID, args RequestVoteArgs) (RequestVoteReply, error)
 	SendAppendEntries(ctx context.Context, to NodeID, args AppendEntriesArgs) (AppendEntriesReply, error)
+	SendInstallSnapshot(ctx context.Context, to NodeID, args InstallSnapshotArgs) (InstallSnapshotReply, error)
 }
 
 // RPCHandler는 transport가 인입 RPC를 raft.Node에 dispatch할 때 호출하는 콜백.
@@ -47,4 +66,5 @@ type Transport interface {
 type RPCHandler interface {
 	HandleRequestVote(ctx context.Context, args RequestVoteArgs) (RequestVoteReply, error)
 	HandleAppendEntries(ctx context.Context, args AppendEntriesArgs) (AppendEntriesReply, error)
+	HandleInstallSnapshot(ctx context.Context, args InstallSnapshotArgs) (InstallSnapshotReply, error)
 }
