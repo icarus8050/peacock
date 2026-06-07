@@ -3,7 +3,7 @@ package transport_test
 import (
 	"bytes"
 	"context"
-	"errors"
+	"encoding/binary"
 	"fmt"
 	"io"
 	"net"
@@ -23,32 +23,45 @@ import (
 // 통합 테스트: bufconn 위에 3노드 raft cluster를 in-process로 띄워 election 수렴, Propose,
 // quorum commit, 모든 노드 apply 카운트 일치를 진짜 gRPC 호출로 검증한다.
 
-// countingSM은 Apply 호출 회수를 노드별로 집계한다 — apply 일치 검증용.
+// countingSM은 적용한 Normal entry 수를 집계한다 — apply 일치 검증용. snapshot은 그
+// 카운터를 8바이트로 직렬화/복원한다(InstallSnapshot catch-up 검증에 충분).
 type countingSM struct {
-	mu      sync.Mutex
-	applied []raft.Entry
+	mu     sync.Mutex
+	normal int
 }
 
 func (s *countingSM) Apply(e raft.Entry) (any, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.applied = append(s.applied, e)
+	if e.Type == raft.EntryNormal {
+		s.normal++
+	}
 	return nil, nil
 }
 
-func (s *countingSM) Snapshot() (io.ReadCloser, error) { return nil, errors.New("not implemented") }
-func (s *countingSM) Restore(io.Reader) error          { return errors.New("not implemented") }
+func (s *countingSM) Snapshot() (io.ReadCloser, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var b [8]byte
+	binary.LittleEndian.PutUint64(b[:], uint64(s.normal))
+	return io.NopCloser(bytes.NewReader(b[:])), nil
+}
+
+func (s *countingSM) Restore(r io.Reader) error {
+	var b [8]byte
+	if _, err := io.ReadFull(r, b[:]); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.normal = int(binary.LittleEndian.Uint64(b[:]))
+	return nil
+}
 
 func (s *countingSM) NormalCount() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	c := 0
-	for _, e := range s.applied {
-		if e.Type == raft.EntryNormal {
-			c++
-		}
-	}
-	return c
+	return s.normal
 }
 
 func TestGRPCCluster_ElectionAndPropose(t *testing.T) {
@@ -198,6 +211,135 @@ func TestGRPCInstallSnapshot_EmptySnapshot(t *testing.T) {
 	if rec.snapArgs.LastIncludedIndex != 4 {
 		t.Fatalf("meta mismatch: %+v", rec.snapArgs)
 	}
+}
+
+// 통합 테스트: 3노드 중 2개만 띄워 quorum으로 다수 entry를 commit·snapshot·압축한 뒤,
+// 뒤처진 3번째 노드를 띄우면 leader가 압축 경계 아래의 entry를 못 보내 InstallSnapshot으로
+// 통째 catch-up시키는지를 진짜 gRPC + 디스크로 검증한다.
+func TestGRPCCluster_InstallSnapshotCatchUp(t *testing.T) {
+	const size = 3
+	peers := make([]raft.PeerInfo, 0, size)
+	for i := 1; i <= size; i++ {
+		peers = append(peers, raft.PeerInfo{ID: raft.NodeID(fmt.Sprintf("node-%d", i)), Addr: fmt.Sprintf("node-%d", i)})
+	}
+
+	// started: 아직 안 뜬 peer로의 dial은 즉시 실패시킨다 — 죽은 peer 대기로 leader의
+	// broadcast(mu 점유)가 막혀 election churn이 나는 것을 피한다.
+	var startedMu sync.Mutex
+	started := make(map[raft.NodeID]*bufconn.Listener)
+	dialer := func(_ context.Context, addr string) (*grpc.ClientConn, error) {
+		startedMu.Lock()
+		lis, ok := started[raft.NodeID(addr)]
+		startedMu.Unlock()
+		if !ok {
+			return nil, fmt.Errorf("peer %q not started", addr)
+		}
+		return grpc.NewClient(
+			"passthrough:///bufconn",
+			grpc.WithTransportCredentials(insecure.NewCredentials()),
+			grpc.WithContextDialer(func(c context.Context, _ string) (net.Conn, error) {
+				return lis.DialContext(c)
+			}),
+		)
+	}
+
+	nodes := make([]*node.Node, size)
+	sms := make([]*countingSM, size)
+	t.Cleanup(func() {
+		for _, n := range nodes {
+			if n != nil {
+				_ = n.Stop()
+			}
+		}
+	})
+
+	start := func(i int) {
+		id := raft.NodeID(fmt.Sprintf("node-%d", i))
+		lis := bufconn.Listen(1 << 20)
+		sm := &countingSM{}
+		nd, err := node.New(node.Options{
+			ID:       id,
+			RaftAddr: string(id),
+			RaftDir:  t.TempDir(),
+			Peers:    peers,
+			SM:       sm,
+			RaftConfig: raft.Config{
+				TickInterval:       5 * time.Millisecond,
+				HeartbeatInterval:  25 * time.Millisecond,
+				ElectionTimeoutMin: 100 * time.Millisecond,
+				ElectionTimeoutMax: 200 * time.Millisecond,
+				SnapshotThreshold:  8,
+			},
+			Dialer:         dialer,
+			RequestTimeout: 200 * time.Millisecond,
+			Listener:       lis,
+		})
+		if err != nil {
+			t.Fatalf("node.New %s: %v", id, err)
+		}
+		nd.Start()
+		nodes[i-1] = nd
+		sms[i-1] = sm
+		startedMu.Lock()
+		started[id] = lis
+		startedMu.Unlock()
+	}
+
+	leaderOf := func(upto int) *node.Node {
+		for _, n := range nodes[:upto] {
+			if n != nil && n.Raft().Role() == raft.RoleLeader {
+				return n
+			}
+		}
+		return nil
+	}
+	waitFor := func(timeout time.Duration, what string, cond func() bool) {
+		t.Helper()
+		deadline := time.Now().Add(timeout)
+		for time.Now().Before(deadline) {
+			if cond() {
+				return
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		t.Fatalf("timeout waiting for: %s", what)
+	}
+
+	// 2노드만 시작 — quorum 2/3.
+	start(1)
+	start(2)
+	waitFor(5*time.Second, "leader among node-1/2", func() bool { return leaderOf(2) != nil })
+
+	// threshold(8)를 크게 넘게 propose → snapshot 발동 + 로그 압축.
+	const proposeN = 25
+	committed := 0
+	waitFor(15*time.Second, "25 entries committed", func() bool {
+		for committed < proposeN {
+			leader := leaderOf(2)
+			if leader == nil {
+				return false
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+			_, err := leader.Raft().Propose(ctx, []byte{byte(committed)})
+			cancel()
+			if err != nil {
+				return false
+			}
+			committed++
+		}
+		return true
+	})
+	waitFor(5*time.Second, "node-1/2 apply all", func() bool {
+		return sms[0].NormalCount() == proposeN && sms[1].NormalCount() == proposeN
+	})
+
+	// 뒤처진 node-3 시작 — 빈 로그라 leader의 압축 경계보다 아래라서, leader는 사라진
+	// entry 대신 snapshot을 통째로 보낸다. 압축으로 옛 entry가 없으므로 같은 카운트에
+	// 도달했다면 InstallSnapshot 경로로 따라잡은 것.
+	start(3)
+	waitFor(10*time.Second, "node-3 catches up to 25 via snapshot", func() bool {
+		return sms[2].NormalCount() == proposeN
+	})
 }
 
 // 아래 헬퍼는 테스트 전용 cluster harness.
